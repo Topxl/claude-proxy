@@ -1,0 +1,110 @@
+{
+  "_commentaire": [
+    "Réglages partagés du projet, versionnés (settings.local.json reste personnel).",
+    "Principe : ce qui LIT passe sans demander, ce qui ÉCRIT en production",
+    "demande, ce qui est irréversible est traité par .claude/hooks/bash_guard.py,",
+    "qui bloque en expliquant le remède plutôt qu'en disant non."
+  ],
+  "permissions": {
+    "allow": [
+      "Edit(*)",
+      "Write(*)",
+      "Bash(ls*)",
+      "Bash(find*)",
+      "Bash(grep*)",
+      "Bash(rg*)",
+      "Bash(cat*)",
+      "Bash(head*)",
+      "Bash(tail*)",
+      "Bash(scripts/check.sh*)",
+      "Bash(bash scripts/check.sh*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add*)",
+      "Bash(git commit*)"
+    ],
+    "_ask_pourquoi": [
+      "Une règle `ask` prime sur bypassPermissions : elle interrompt TOUJOURS.",
+      "Mesuré sur DJ le 2026-08-07, 209 sessions et 20 562 appels Bash : 942",
+      "interruptions, dont 98 % pour « rm * » et « kill * », qui n'ont jamais",
+      "rien empêché. Un garde-fou accepté 921 fois de suite entraîne à valider",
+      "sans lire : il est pire qu'inutile. Ces deux motifs ne sont donc PAS ici,",
+      "la protection contre un effacement catastrophique est dans le hook, qui",
+      "sait viser la racine sans gêner le nettoyage courant.",
+      "Ne garder ici que le rare ET l'engageant : ce qui écrase du travail, et",
+      "le fichier qui porte les secrets.",
+      "Et se souvenir qu'une règle `ask` devient décorative dès qu'un hook",
+      "exécute la commande : un hook ne passe pas par les permissions."
+    ],
+    "ask": [
+      "Bash(git reset --hard*)",
+      "Read(.env)",
+      "Edit(.env)",
+      "Write(.env)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f *)"
+    ]
+  },
+  "respectGitignore": true,
+  "_hooks_pourquoi": [
+    "bash_guard.py porte l'irréversible, jamais le style.",
+    "stuck_detector.py fait la prise de hauteur quand la session patine.",
+    "deploy_report.sh est POSÉ mais PAS branché : il remonte le verdict d'un",
+    "déploiement asynchrone en lisant .claude/deploy_status.json. Le brancher",
+    "en UserPromptSubmit le jour où un scripts/deploy_*.sh écrit ce fichier,",
+    "pas avant : un hook bavard à vide coûte du contexte à chaque message.",
+    "Un plugin s'active ici, au niveau du projet, jamais en global : il charge",
+    "ses skills dans le prompt de chaque session qui le voit."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/bash_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/stuck_detector.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/playwright_cleanup.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/playwright_cleanup.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
