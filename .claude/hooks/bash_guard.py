@@ -191,4 +191,27 @@ for _seg in re.split(r"&&|\|\||;|\n|\|", cmd):
 #
 # Chaque règle ajoutée porte sa DATE et son INCIDENT. Rien pour le style.
 
+# 2026-08-27 : suicide collectif des sous-agents.
+# Incident : quatre sous-agents lances en parallele sur le projet keep sont
+# morts trois fois de suite en pleine tache, perdant des heures de travail.
+# Cause : les sous-agents `claude` sont des enfants de claude-proxy.service.
+# Un agent qui redemarre ce service (ou hermes-gateway, qui l'entraine) tue
+# donc tous ses confreres ET lui-meme. Deux sauvegardes d'unite datees du jour
+# le prouvent : .bak-autocompact et .bak-cache-ttl.
+# Remede : editer l'unite, puis demander a VJ de la recharger, ou passer par
+# scripts/redemarrer-au-calme.sh qui attend la fin des tours.
+_SERVICES_VITAUX = ("claude-proxy", "hermes-gateway")
+if re.search(r"\bsystemctl\b", cmd) and re.search(
+    r"\b(restart|stop|kill|reload-or-restart|try-restart)\b", cmd
+):
+    for _svc in _SERVICES_VITAUX:
+        if _svc in cmd:
+            deny(
+                f"« {_svc} » heberge les sous-agents en cours : le redemarrer "
+                "les tue tous, y compris celui qui lance la commande. "
+                "Incident du 2026-08-27, trois series d'agents perdues. "
+                "Edite l'unite si tu veux, mais laisse VJ la recharger."
+            )
+
+
 sys.exit(0)
