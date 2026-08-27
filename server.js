@@ -427,6 +427,25 @@ function clesDe(messages) {
 }
 
 /*
+ * Le dernier message utilisateur est volatil.
+ *
+ * Mesure du 27/08 : une session stockee avec un dernier message de 1159
+ * caracteres se representait au tour suivant avec 185 caracteres pour ce meme
+ * message. Hermes enrichit le message courant au moment de l'envoi (contexte de
+ * session, rappels) puis n'en garde que le texte nu dans son historique. Toute
+ * cle calculee sur ce message casse donc systematiquement au tour suivant.
+ *
+ * On indexe chaque session sous deux jeux de cles : l'historique complet, et
+ * l'historique prive de son dernier message. La recherche par prefixe attrape
+ * le second des que le premier a bouge, sans rien perdre du contexte.
+ */
+function clesEtendues(messages) {
+  const cles = clesDe(messages);
+  if (messages.length > 1) cles.push(...clesDe(messages.slice(0, -1)));
+  return cles;
+}
+
+/*
  * Diagnostic de rupture de chaine.
  *
  * Une empreinte qui ne matche pas ne dit pas POURQUOI. On garde donc, a cote
@@ -570,7 +589,7 @@ function planifierSession(messages, promptAplati, imagesAplati) {
       args: ['--resume', entry.id],
       prompt: texte,
       images: imagesDernier,
-      cles: clesDe(messages),
+      cles: clesEtendues(messages),
       sig: signature(messages),
     };
   }
@@ -589,7 +608,7 @@ function planifierSession(messages, promptAplati, imagesAplati) {
     args: ['--session-id', neuve.id],
     prompt: promptAplati,
     images: imagesAplati,
-    cles: clesDe(messages),
+    cles: clesEtendues(messages),
     sig: signature(messages),
   };
 }
