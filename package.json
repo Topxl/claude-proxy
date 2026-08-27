@@ -1,0 +1,16 @@
+{
+  "name": "claude-proxy",
+  "version": "1.0.0",
+  "description": "Proxy local exposant le CLI claude derriere une API compatible Anthropic",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

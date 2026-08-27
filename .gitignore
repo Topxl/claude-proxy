@@ -1,0 +1,14 @@
+# Dependances
+node_modules/
+
+# Wheels Python deposes ici par erreur (pyrit), sans rapport avec le proxy
+*.whl
+*.tar.gz
+
+# Sauvegardes horodatees : l'historique git les remplace
+*.bak
+*.bak-*
+
+# Caches
+.ruff_cache/
+web-articles/
