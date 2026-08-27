@@ -597,7 +597,14 @@ function planifierSession(messages, promptAplati, imagesAplati) {
   const neuve = { id: randomUUID(), tours: 0, busy: true, ts: Date.now() };
   let motif;
   if (messages.length < 3) motif = 'debut-conversation';
-  else if (!entry) motif = `chaine-introuvable ${diagnostiquerRupture(signature(messages.slice(0, -2)))}`;
+  else if (!entry) {
+    const essais = [];
+    for (let k = 2; k <= profondeurMax; k += 1) {
+      const cs = clesDe(messages.slice(0, -k));
+      essais.push(`${k}:${cs.map((c) => (sessions.has(c) ? '1' : '0')).join('')}`);
+    }
+    motif = `chaine-introuvable ${diagnostiquerRupture(signature(messages.slice(0, -2)))} cles=${sessions.size} essais=${essais.slice(0, 6).join(',')}`;
+  }
   else if (entry.busy) motif = 'session-occupee';
   else if (entry.tours >= SESSION_TOURS_MAX) motif = 'plafond-tours';
   else if (!avantDernier || avantDernier.role !== 'assistant') motif = `avant-dernier=${avantDernier ? avantDernier.role : 'absent'}`;
@@ -1216,6 +1223,25 @@ app.get(['/health', '/anthropic/health'], (_req, res) => {
   });
 });
 
+let __dumpRestants = 6;
+function __dumpPayload(messages) {
+  if (__dumpRestants <= 0) return;
+  __dumpRestants -= 1;
+  try {
+    const { mkdirSync, writeFileSync: __wfs } = require('fs');
+    mkdirSync('/tmp/proxy-payloads', { recursive: true });
+    const compact = messages.map((m) => ({
+      role: m && m.role,
+      content: typeof m?.content === 'string'
+        ? m.content.slice(0, 400)
+        : Array.isArray(m?.content)
+          ? m.content.map((b) => ({ type: b?.type, apercu: JSON.stringify(b).slice(0, 400) }))
+          : m?.content,
+    }));
+    __wfs(`/tmp/proxy-payloads/${Date.now()}.json`, JSON.stringify(compact, null, 1));
+  } catch (e) { console.error('[dump]', e.message); }
+}
+
 async function handleMessages(req, res) {
   const { messages, model, system, stream } = req.body || {};
 
@@ -1227,6 +1253,7 @@ async function handleMessages(req, res) {
     return;
   }
 
+  __dumpPayload(messages);
   const prompt = buildPrompt(messages);
   const images = extractImages(messages);
   // Une photo sans legende est une requete valide : le texte seul ne suffit
