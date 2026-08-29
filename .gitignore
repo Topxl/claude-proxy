@@ -12,3 +12,4 @@ node_modules/
 # Caches
 .ruff_cache/
 web-articles/
+.claude/worktrees/
