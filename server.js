@@ -81,7 +81,9 @@ const PING_MS = 5_000;
 const KEEPALIVE_MS = Number(process.env.CLAUDE_KEEPALIVE_MS) || 30_000;
 // Garde-fou : si le CLI n'emet plus rien du tout, on arrete le keepalive pour
 // laisser Hermes detecter la panne au lieu de la masquer indefiniment.
-const KEEPALIVE_MAX_SILENCE_MS = Number(process.env.CLAUDE_KEEPALIVE_MAX_SILENCE_MS) || 180_000;
+// 0 = illimite. Le timeout d'inactivite (TIMEOUT_MS) protege deja contre un flux mort ;
+// arreter le keepalive faisait fermer la connexion cote client, donc SIGKILL silencieux.
+const KEEPALIVE_MAX_SILENCE_MS = Number(process.env.CLAUDE_KEEPALIVE_MAX_SILENCE_MS) || 0;
 const MAX_ATTEMPTS = Number(process.env.CLAUDE_MAX_ATTEMPTS) || 3;
 // Journal d'outils (« → Bash: date ») dans le stream. DESACTIVE par defaut :
 // juste le texte, comme avant. Mettre CLAUDE_STREAM_TRACE=1 pour l'activer.
@@ -1126,7 +1128,7 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
   let lastCliActivity = Date.now();
   let keepaliveSent = 0;
   const keepalive = setInterval(() => {
-    if (Date.now() - lastCliActivity > KEEPALIVE_MAX_SILENCE_MS) return;
+    if (KEEPALIVE_MAX_SILENCE_MS > 0 && Date.now() - lastCliActivity > KEEPALIVE_MAX_SILENCE_MS) return;
     keepaliveSent += 1;
     send('content_block_delta', {
       type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '' },
@@ -1136,11 +1138,21 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
   let outputText = '';
   let child = null;
   let aborted = false;
-  const onClose = () => { aborted = true; if (child) child.kill('SIGKILL'); };
+  // Porte-cle du process fils. runClaudeWithRetry y pose .child au spawn, qui peut
+  // arriver bien apres cet appel si la requete passe par la file d'attente.
+  const emit = () => {};
+  const onClose = () => {
+    aborted = true;
+    // emit.child est la source de verite : la variable child peut encore etre nulle.
+    const vise = child || emit.child || null;
+    console.warn(`[coupure] client parti apres ${Date.now() - started} ms, `
+      + `silence CLI ${Date.now() - lastCliActivity} ms, ${outputText.length} car emis, `
+      + `keepalive x${keepaliveSent}, fils ${vise ? 'tue' : 'absent'}`);
+    if (vise) vise.kill('SIGKILL');
+  };
   res.on('close', onClose);
 
   try {
-    const emit = () => {};  // inutilise ici ; conserve pour porter .child
     // Temps reel : texte + journal d'outils, token par token, dans le bloc 0.
     const onDelta = (text) => {
       if (!text) return;
@@ -1365,7 +1377,7 @@ const server = app.listen(PORT, '127.0.0.1', () => {
   console.log(`claude-proxy en ecoute sur http://localhost:${PORT}`);
   console.log(`POST /v1/messages et /anthropic/v1/messages  ->  ${CLAUDE_BIN} -p (stdin, stream-json)`);
   console.log(`concurrence max ${MAX_CONCURRENCY}, timeout ${TIMEOUT_MS} ms, settings ${CLAUDE_SETTINGS}`);
-  console.log(`keepalive stream toutes les ${KEEPALIVE_MS} ms, silence max tolere ${KEEPALIVE_MAX_SILENCE_MS} ms`);
+  console.log(`keepalive stream toutes les ${KEEPALIVE_MS} ms, silence max tolere ${KEEPALIVE_MAX_SILENCE_MS || 'illimite'}`);
 });
 // Un stream de 30 min ne doit pas etre coupe par le timeout de socket d'Express.
 server.requestTimeout = 0;
