@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -81,7 +81,7 @@ const PING_MS = 5_000;
 const KEEPALIVE_MS = Number(process.env.CLAUDE_KEEPALIVE_MS) || 30_000;
 // Garde-fou : si le CLI n'emet plus rien du tout, on arrete le keepalive pour
 // laisser Hermes detecter la panne au lieu de la masquer indefiniment.
-// 0 = illimite. Le timeout d'inactivite (TIMEOUT_MS) protege deja contre un flux mort ;
+// 0 = illimite. Le timeout d'inactivite (TIMEOUT_MS, 30 min en service) protege deja ;
 // arreter le keepalive faisait fermer la connexion cote client, donc SIGKILL silencieux.
 const KEEPALIVE_MAX_SILENCE_MS = Number(process.env.CLAUDE_KEEPALIVE_MAX_SILENCE_MS) || 0;
 const MAX_ATTEMPTS = Number(process.env.CLAUDE_MAX_ATTEMPTS) || 3;
@@ -1247,7 +1247,6 @@ function __dumpPayload(messages) {
   if (__dumpRestants <= 0) return;
   __dumpRestants -= 1;
   try {
-    const { mkdirSync, writeFileSync: __wfs } = require('fs');
     mkdirSync('/tmp/proxy-payloads', { recursive: true });
     const compact = messages.map((m) => ({
       role: m && m.role,
@@ -1257,7 +1256,7 @@ function __dumpPayload(messages) {
           ? m.content.map((b) => ({ type: b?.type, apercu: JSON.stringify(b).slice(0, 400) }))
           : m?.content,
     }));
-    __wfs(`/tmp/proxy-payloads/${Date.now()}.json`, JSON.stringify(compact, null, 1));
+    writeFileSync(`/tmp/proxy-payloads/${Date.now()}.json`, JSON.stringify(compact, null, 1));
   } catch (e) { console.error('[dump]', e.message); }
 }
 
