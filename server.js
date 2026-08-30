@@ -109,6 +109,49 @@ const waiting = [];
 // Process claude vivants, pour les tuer proprement a l'arret du service.
 const liveChildren = new Set();
 
+/*
+ * Registre des tours en vol : qui parle, depuis quand, et depuis combien de
+ * temps il se tait.
+ *
+ * `running` ne disait qu'une chose : combien ils etaient. Quand un tour mourait
+ * en silence, rien ne permettait de dire lequel, ni depuis quand, ni pourquoi.
+ * Un agent muet et un agent mort avaient exactement la meme signature : aucune.
+ * Le veilleur exterieur lit /encours et tranche.
+ */
+const enVol = new Map();
+let __volSeq = 0;
+
+// Un tour fini proprement s'efface tout de suite : il n'apprend rien a personne.
+// Une coupure ou une erreur reste lisible une demi-heure, le temps qu'un
+// veilleur passe et la signale, meme s'il tourne toutes les 5 minutes.
+const FIN_ANORMALE_TTL_MS = 30 * 60 * 1000;
+
+function suivre(info) {
+  const id = `v${(__volSeq += 1)}`;
+  const t = Date.now();
+  enVol.set(id, { id, debut: t, activite: t, octets: 0, issue: null, ...info });
+  return {
+    id,
+    touche(octets) {
+      const e = enVol.get(id);
+      if (!e) return;
+      e.activite = Date.now();
+      if (octets) e.octets = octets;
+    },
+    fin(issue, detail) {
+      const e = enVol.get(id);
+      // La premiere issue posee fait foi : onClose voit la coupure avant que le
+      // bloc finally ne conclue, et c'est lui qui a raison.
+      if (!e || e.issue) return;
+      e.issue = issue;
+      e.finVers = Date.now();
+      if (detail) e.detail = String(detail).slice(0, 200);
+      if (issue === 'fini') enVol.delete(id);
+      else setTimeout(() => enVol.delete(id), FIN_ANORMALE_TTL_MS).unref();
+    },
+  };
+}
+
 // MAX_CONCURRENCY est calcule au demarrage sur la RAM totale. Mais la RAM
 // *disponible* bouge : Jellyfin qui transcode, un bounce DJ, une session
 // Claude Code. Ce garde relit MemAvailable avant chaque octroi, pour que la
@@ -1125,6 +1168,14 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
 
   const ping = setInterval(() => send('ping', { type: 'ping' }), PING_MS);
 
+  const vol = suivre({
+    mode: 'stream',
+    modele: spec.model || 'defaut',
+    effort: spec.effort || 'defaut',
+    // De quoi reconnaitre le chantier d'un coup d'oeil, sans deverser le prompt.
+    apercu: String(prompt || '').slice(0, 90).replace(/\s+/g, ' '),
+  });
+
   let lastCliActivity = Date.now();
   let keepaliveSent = 0;
   const keepalive = setInterval(() => {
@@ -1148,6 +1199,7 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
     console.warn(`[coupure] client parti apres ${Date.now() - started} ms, `
       + `silence CLI ${Date.now() - lastCliActivity} ms, ${outputText.length} car emis, `
       + `keepalive x${keepaliveSent}, fils ${vise ? 'tue' : 'absent'}`);
+    vol.fin('coupure', `${outputText.length} car emis, silence ${Date.now() - lastCliActivity} ms`);
     if (vise) vise.kill('SIGKILL');
   };
   res.on('close', onClose);
@@ -1158,12 +1210,13 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
       if (!text) return;
       outputText += text;
       lastCliActivity = Date.now();
+      vol.touche(outputText.length);
       send('content_block_delta', {
         type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text },
       });
     };
     const promise = runClaudeWithRetry({ prompt, system, spec, images, sess }, emit, 'stream', {
-      onActivity: () => { lastCliActivity = Date.now(); },
+      onActivity: () => { lastCliActivity = Date.now(); vol.touche(outputText.length); },
       onDelta,
     });
     child = emit.child || null;
@@ -1177,12 +1230,14 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
     });
     send('message_stop', { type: 'message_stop' });
     console.log(`[stream] ${spec.model || 'defaut'}/${spec.effort || 'defaut'} ${prompt.length} car -> ${outputText.length} car en ${Date.now() - started} ms (keepalive x${keepaliveSent})`);
+    vol.fin('fini');
   } catch (error) {
     if (aborted) {
       console.warn(`[stream] client parti apres ${Date.now() - started} ms`);
       return;
     }
     console.error(`[stream] echec en ${Date.now() - started} ms: ${error.message}`);
+    vol.fin(error.timedOut ? 'timeout' : 'erreur', error.message);
     // Le stream a deja un statut 200 : l'erreur passe par un event, pas par le code HTTP.
     send('error', {
       type: 'error',
@@ -1194,6 +1249,9 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
   } finally {
     clearInterval(ping);
     clearInterval(keepalive);
+    // Filet : un chemin de sortie oublie laisserait un tour eternellement en vol,
+    // et le veilleur crierait a l'agent mort pour un tour qui allait tres bien.
+    vol.fin('interrompu');
     res.off('close', onClose);
     if (!res.writableEnded) res.end();
   }
@@ -1239,6 +1297,19 @@ app.get(['/health', '/anthropic/health'], (_req, res) => {
     cpuPressure: Number(cpuPressure().toFixed(1)),
     cpuPressureCeiling: CPU_PRESSURE_CEILING,
     ...health,
+  });
+});
+
+app.get(['/encours', '/anthropic/encours'], (_req, res) => {
+  const t = Date.now();
+  res.json({
+    running,
+    queued: waiting.length,
+    tours: [...enVol.values()].map((e) => ({
+      ...e,
+      ageS: Math.round((t - e.debut) / 1000),
+      silenceS: Math.round((t - e.activite) / 1000),
+    })).sort((x, y) => y.silenceS - x.silenceS),
   });
 });
 
