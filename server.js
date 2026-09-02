@@ -4,9 +4,67 @@ import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import {
+  readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, readdirSync,
+} from 'node:fs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// --- Dossier de travail par topic ------------------------------------------
+// Le CLI fige son "dossier de projet" au lancement : c'est lui qui decide quel
+// CLAUDE.md est lu et quels hooks de .claude/settings.json se declenchent. Tant
+// que tout tournait dans HERE, un topic dedie a un projet (ex. Yantra DJ) ne
+// voyait ni sa doctrine ni son hook de deploiement.
+//
+// La resolution est refaite a CHAQUE tour, jamais mise en cache : ecrire la
+// table pendant une conversation deplace donc le topic des le message suivant,
+// sans redemarrer le proxy. C'est ce qui rend le changement de dossier en
+// cours de route possible ("on passe sur passreal") et l'entree dans un dossier
+// tout neuf immediate.
+//
+// Trois etages, du plus explicite au plus devinable :
+//   1. ~/.hermes/topics-cwd.json    { "4469": "/home/vj/Bureau/Projets/DJ" }
+//   2. ~/.hermes/qg-noms.json       { "4469": "DJ" } -> ~/Bureau/Projets/DJ
+//      (le nom du topic sert de nom de dossier, casse ignoree : un topic
+//       nomme comme son projet n'a rien a declarer)
+//   3. HERE, le dossier du proxy.
+// Un dossier absent ou illisible retombe a l'etage suivant, jamais d'echec dur.
+const TABLE_CWD = path.join(os.homedir(), '.hermes', 'topics-cwd.json');
+const TABLE_NOMS = path.join(os.homedir(), '.hermes', 'qg-noms.json');
+const RACINE_PROJETS = path.join(os.homedir(), 'Bureau', 'Projets');
+
+function lireJson(fichier) {
+  try { return JSON.parse(readFileSync(fichier, 'utf8')); } catch { return {}; }
+}
+
+function dossierParNom(nom) {
+  if (!nom) return null;
+  const direct = path.join(RACINE_PROJETS, nom);
+  if (existsSync(direct)) return direct;
+  // Casse libre : le topic "Passreal" trouve le dossier "passreal".
+  try {
+    const cible = nom.toLowerCase();
+    for (const e of readdirSync(RACINE_PROJETS, { withFileTypes: true })) {
+      if (e.isDirectory() && e.name.toLowerCase() === cible) {
+        return path.join(RACINE_PROJETS, e.name);
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function topicDe(system) {
+  const m = system && /thread:\s*(\d+)/.exec(system);
+  return m ? m[1] : null;
+}
+
+function cwdPourTopic(system) {
+  const topic = topicDe(system);
+  if (!topic) return HERE;
+  const declare = lireJson(TABLE_CWD)[topic];
+  if (declare && existsSync(declare)) return declare;
+  return dossierParNom(lireJson(TABLE_NOMS)[topic]) || HERE;
+}
 
 const PORT = Number(process.env.PORT) || 8000;
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
@@ -587,7 +645,7 @@ function oublierSession(entry) {
  * on repart sur une session neuve avec le prompt aplati : c'est le repli voulu,
  * pas une panne.
  */
-function planifierSession(messages, promptAplati, imagesAplati) {
+function planifierSession(messages, promptAplati, imagesAplati, dossier) {
   if (!RESUME_ACTIF) return null;
   purgerSessions();
 
@@ -619,6 +677,15 @@ function planifierSession(messages, promptAplati, imagesAplati) {
   const reprenable = Boolean(
     entry && !entry.busy
     && entry.tours < SESSION_TOURS_MAX
+    /*
+     * Le journal d'une session CLI vit sous ~/.claude/projects/<dossier encode>.
+     * Reprendre depuis un AUTRE dossier ne le retrouve pas : le CLI repart
+     * muet, sans erreur visible. Quand le topic change de projet en cours de
+     * route, on repart donc sur une session neuve, avec l'historique aplati
+     * que Hermes renvoie de toute facon : rien n'est perdu, seul le cache de
+     * prefixe est repaye une fois.
+     */
+    && entry.dir === dossier
     && avantDernier && avantDernier.role === 'assistant'
     && (texte || imagesDernier.length),
   );
@@ -639,7 +706,9 @@ function planifierSession(messages, promptAplati, imagesAplati) {
     };
   }
 
-  const neuve = { id: randomUUID(), tours: 0, busy: true, ts: Date.now() };
+  const neuve = {
+    id: randomUUID(), tours: 0, busy: true, ts: Date.now(), dir: dossier,
+  };
   let motif;
   if (messages.length < 3) motif = 'debut-conversation';
   else if (!entry) {
@@ -650,6 +719,7 @@ function planifierSession(messages, promptAplati, imagesAplati) {
     }
     motif = `chaine-introuvable ${diagnostiquerRupture(signature(messages.slice(0, -2)))} cles=${sessions.size} essais=${essais.slice(0, 6).join(',')}`;
   }
+  else if (entry.dir !== dossier) motif = `dossier-change ${entry.dir} -> ${dossier}`;
   else if (entry.busy) motif = 'session-occupee';
   else if (entry.tours >= SESSION_TOURS_MAX) motif = 'plafond-tours';
   else if (!avantDernier || avantDernier.role !== 'assistant') motif = `avant-dernier=${avantDernier ? avantDernier.role : 'absent'}`;
@@ -907,7 +977,13 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       args.push('--system-prompt', `${system}\n${DIRECTIVE_GROUPAGE}`);
     }
 
-    const child = spawn(CLAUDE_BIN, args, { cwd: HERE, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const dossier = cwdPourTopic(system);
+    if (dossier !== HERE) console.log(`[cwd] ${dossier}`);
+    const child = spawn(CLAUDE_BIN, args, {
+      cwd: dossier,
+      env: { ...process.env, HERMES_TOPIC: topicDe(system) || '', HERMES_TOPIC_DIR: dossier },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     // L'unite tourne en KillMode=process pour epargner Chrome et le demon
     // OpenCLI, qui vivent dans le meme cgroup. C'est donc au proxy de tuer
     // ses propres enfants a l'arret, sinon ils survivent en orphelins.
@@ -1407,7 +1483,7 @@ async function handleMessages(req, res) {
 
   try {
     const spec = parseModelSpec(model, req.body);
-    const sess = planifierSession(messages, prompt, images);
+    const sess = planifierSession(messages, prompt, images, cwdPourTopic(systemText));
     const payload = {
       prompt, system: systemText, spec, images, sess, model, inputTokens, started, queueNotice,
     };

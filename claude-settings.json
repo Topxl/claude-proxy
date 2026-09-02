@@ -1,3 +1,4 @@
 {
-  "disableAllHooks": true
+  "_commentaire": "Hooks actifs pour RTK. Les hooks sonores et de renommage sont neutralises cote ~/.claude/settings.json par la garde CLAUDE_TIMEOUT_MS.",
+  "disableAllHooks": false
 }
