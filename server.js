@@ -896,6 +896,60 @@ const OUTILS_HERMES = process.env.CLAUDE_OUTILS
  *
  * Deux appels independants dans le MEME message ne coutent qu'une boucle.
  */
+/**
+ * Cibles `-notools` : le modele fabrique parfois la syntaxe d'appel d'outil en
+ * TEXTE (`<invoke name="Bash">...`), faute d'outil reel pour la porter. Ce
+ * texte partait tel quel dans Telegram. On la retire a la source, cote proxy :
+ * c'est le seul point que toutes les cibles sans outils traversent.
+ */
+// Chaque balise doit s'apparier avec SA propre fermeture : une alternation
+// commune faisait fermer un `<invoke>` sur un `</parameter>`, et laissait
+// filtrer la commande. On retire donc du plus interne vers le plus externe.
+const BLOCS_OUTIL = ['parameter', 'invoke', 'function_calls'].map(
+  (b) => new RegExp(`<(?:antml:)?${b}\\b[\\s\\S]*?<\\/(?:antml:)?${b}>`, 'gi'),
+);
+const RE_OUVERTURE_OUTIL = /<(?:antml:)?(?:function_calls|invoke|parameter)\b/i;
+const RE_BALISE_ORPHELINE = /<\/?(?:antml:)?(?:function_calls|invoke|parameter)\b[^>]*>?/gi;
+
+function sansBlocsOutil(texte) {
+  let t = texte;
+  let avant;
+  do {
+    avant = t;
+    for (const re of BLOCS_OUTIL) t = t.replace(re, '');
+  } while (t !== avant);
+  return t;
+}
+
+function sansBalisesOutil(texte) {
+  if (!texte) return texte;
+  let t = sansBlocsOutil(texte);
+  // Une ouverture qui subsiste = un appel jamais referme : tout ce qui suit
+  // appartient a l'appel, y compris la commande. On coupe jusqu'a la fin.
+  const ouvert = t.search(RE_OUVERTURE_OUTIL);
+  if (ouvert >= 0) t = t.slice(0, ouvert);
+  return t.replace(RE_BALISE_ORPHELINE, '').replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+/**
+ * Meme nettoyage, mais sur un flux : une balise arrive en plusieurs morceaux.
+ * On retient donc la queue tant qu'elle peut encore devenir une balise.
+ */
+function filtreOutilStream() {
+  let tampon = '';
+  return {
+    push(morceau) {
+      tampon = sansBlocsOutil(tampon + morceau);
+      const ouvert = tampon.search(RE_OUVERTURE_OUTIL);
+      if (ouvert >= 0) { const avant = tampon.slice(0, ouvert); tampon = tampon.slice(ouvert); return avant; }
+      const i = tampon.lastIndexOf('<');
+      if (i >= 0 && tampon.length - i < 24) { const avant = tampon.slice(0, i); tampon = tampon.slice(i); return avant; }
+      const tout = tampon; tampon = ''; return tout;
+    },
+    fin() { const t = sansBalisesOutil(tampon); tampon = ''; return t; },
+  };
+}
+
 const DIRECTIVE_GROUPAGE = [
   '',
   '## Economie de contexte (imperatif)',
@@ -952,6 +1006,10 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     if (spec?.noTools) {
       args.push('--tools', '');
       args.push('--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config');
+      // Sans cela le CLI charge le CLAUDE.md global de VJ, dont RTK.md, qui
+      // ordonne d'emettre des commandes Bash : une cible sans outils se met
+      // alors a les ecrire en texte. Coupe aussi la fuite du contexte perso.
+      args.push('--setting-sources', '');
     } else {
       // Socle reduit. Mesure du 2026-08-26 : le toolset complet du CLI coute
       // 38 255 tokens de contexte AVANT le premier mot, relus a chaque appel.
@@ -974,7 +1032,10 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       const hTout = createHash('sha1').update(system).digest('hex').slice(0, 8);
       const hTete = createHash('sha1').update(system.slice(0, 4000)).digest('hex').slice(0, 8);
       console.log(`[sys] len=${system.length} tout=${hTout} tete4k=${hTete}`);
-      args.push('--system-prompt', `${system}\n${DIRECTIVE_GROUPAGE}`);
+      // La directive de groupage parle d'appels d'outils : la coller a une
+      // cible qui n'en a aucun lui apprend justement a en fabriquer en texte.
+      const consigne = spec?.noTools ? system : `${system}\n${DIRECTIVE_GROUPAGE}`;
+      args.push('--system-prompt', consigne);
     }
 
     const dossier = cwdPourTopic(system);
@@ -993,6 +1054,9 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     let buffer = '';
     let stderr = '';
     let full = '';
+    // Cible sans outils : le texte peut contenir de la fausse syntaxe d'appel.
+    const filtre = spec?.noTools ? filtreOutilStream() : null;
+    const propre = (t) => (spec?.noTools ? sansBalisesOutil(t) : t);
     let failure = null;
     let timedOut = false;
     // Journal d'outils compact (une ligne par appel, dedupe).
@@ -1024,7 +1088,11 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
             ? { name: cb.name || 'outil', input: '' } : null;
         } else if (e.type === 'content_block_delta') {
           const d = e.delta || {};
-          if (d.type === 'text_delta' && d.text) { full += d.text; onDelta(d.text); }
+          if (d.type === 'text_delta' && d.text) {
+            full += d.text;
+            const sortie = filtre ? filtre.push(d.text) : d.text;
+            if (sortie) onDelta(sortie);
+          }
           else if (d.type === 'input_json_delta' && toolEnCours && d.partial_json) {
             toolEnCours.input += d.partial_json;
           }
@@ -1054,7 +1122,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
         const text = extractText(evt.message?.content);
         if (text) {
           full += (full ? '\n' : '') + text;
-          onText(text);
+          onText(propre(text));
         }
       } else if (evt.type === 'result' && evt.is_error) {
         const msg = evt.result || 'Erreur du CLI claude.';
@@ -1097,7 +1165,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       if (timedOut) {
         // Du texte a deja ete produit : le rendre vaut mieux que le silence.
         if (full.trim()) {
-          resolve(`${full}\n\n_(coupe : ${Math.round(TIMEOUT_MS / 1000)} s sans activite du CLI)_`);
+          resolve(`${propre(full)}\n\n_(coupe : ${Math.round(TIMEOUT_MS / 1000)} s sans activite du CLI)_`);
           return;
         }
         reject(Object.assign(new Error(`Le CLI claude a depasse ${TIMEOUT_MS} ms.`), { timedOut: true, stderr }));
@@ -1118,7 +1186,11 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
         reject(Object.assign(new Error('Le CLI claude n a produit aucun texte.'), { stderr }));
         return;
       }
-      resolve(full);
+      if (filtre) {
+        const queue = filtre.fin();
+        if (queue && onDelta) onDelta(queue);
+      }
+      resolve(propre(full));
     });
 
     child.stdin.on('error', () => {});
