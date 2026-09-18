@@ -17,3 +17,4 @@ web-articles/
 
 # Lien local vers claude-supertool, propre a la machine
 supertool
+__pycache__/
