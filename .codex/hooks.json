@@ -1,0 +1,50 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 '/home/vj/Bureau/Projets/claude-proxy/.codex/hooks/bash_guard.py'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/home/vj/Bureau/Projets/claude-proxy/.codex/hooks/playwright_cleanup.sh'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 '/home/vj/Bureau/Projets/claude-proxy/.codex/hooks/stuck_detector.py'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/home/vj/Bureau/Projets/claude-proxy/.codex/hooks/playwright_cleanup.sh'",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
