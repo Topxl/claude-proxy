@@ -204,8 +204,10 @@ _SERVICES_VITAUX = ("claude-proxy", "hermes-gateway")
 if re.search(r"\bsystemctl\b", cmd) and re.search(
     r"\b(restart|stop|kill|reload-or-restart|try-restart)\b", cmd
 ):
+    # Les instances distantes (claude-proxy-marwell sur le Pi) n'hebergent
+    # aucun sous-agent de cette machine : elles ne sont pas vitales ici.
     for _svc in _SERVICES_VITAUX:
-        if _svc in cmd:
+        if re.search(re.escape(_svc) + r"(?!-marwell)", cmd):
             deny(
                 f"« {_svc} » heberge les sous-agents en cours : le redemarrer "
                 "les tue tous, y compris celui qui lance la commande. "
