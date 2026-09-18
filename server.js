@@ -7,6 +7,20 @@ import os from 'node:os';
 import {
   readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, readdirSync,
 } from 'node:fs';
+import { unlinkSync, statSync } from 'node:fs';
+
+// Prompts systeme trop gros pour argv (voir E2BIG plus bas). Purge au
+// demarrage de tout ce qui date de plus de 24 h : ces fichiers ne servent
+// qu'a la duree de vie des sessions en cours.
+const DOSSIER_PROMPTS = path.join(os.tmpdir(), 'claude-proxy-prompts');
+try {
+  mkdirSync(DOSSIER_PROMPTS, { recursive: true });
+  const limite = Date.now() - 24 * 3600 * 1000;
+  for (const f of readdirSync(DOSSIER_PROMPTS)) {
+    const c = path.join(DOSSIER_PROMPTS, f);
+    if (statSync(c).mtimeMs < limite) unlinkSync(c);
+  }
+} catch (e) { console.warn('[sys] purge prompts impossible:', e.message); }
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -850,7 +864,30 @@ const FATAL_PATTERNS = [
   /out of extra usage/i,
 ];
 
+// Le CLI ecrit sur stderr des avertissements qui ne sont PAS des pannes :
+// dossier non marque comme fiable, warnings de Node, mises a jour. Quand ils
+// etaient le seul contenu de stderr, ils remplacaient le vrai message d'erreur
+// et Hermes affichait "trust dialog" pour une panne de quota. Mesure du
+// 2026-09-10 : 8 des 13 echecs d'agents portaient ce faux motif.
+const STDERR_BENIN = [
+  /^Ignoring \d+ permissions\.allow entries from/i,
+  /this workspace has not been trusted/i,
+  /^\(node:\d+\)/i,
+  /ExperimentalWarning|DeprecationWarning|punycode/i,
+  /^\s*\(Use `node --trace-warnings/i,
+  /npm notice|new version of|update available/i,
+];
+function stderrUtile(stderr) {
+  const restant = String(stderr || '')
+    .split('\n')
+    .filter((l) => l.trim() && !STDERR_BENIN.some((re) => re.test(l.trim())))
+    .join('\n')
+    .trim();
+  return restant;
+}
+
 function isFatal(message) {
+
   const text = String(message || '');
   return FATAL_PATTERNS.some((re) => re.test(text));
 }
@@ -1035,7 +1072,24 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       // La directive de groupage parle d'appels d'outils : la coller a une
       // cible qui n'en a aucun lui apprend justement a en fabriquer en texte.
       const consigne = spec?.noTools ? system : `${system}\n${DIRECTIVE_GROUPAGE}`;
-      args.push('--system-prompt', consigne);
+      // Le noyau limite UN argument d'exec a MAX_ARG_STRLEN = 32 pages, soit
+      // 131072 octets, quel que soit ARG_MAX. Au-dela, spawn echoue en E2BIG
+      // et le tour est perdu apres 3 tentatives identiques. C'est arrive des
+      // que la bibliotheque de documents Marwell (148 Ko) a ete injectee dans
+      // le prompt systeme. On bascule donc sur --system-prompt-file, que le
+      // CLI accepte. Le fichier est nomme d'apres l'empreinte du contenu :
+      // deux tours au meme prompt reutilisent le meme fichier, ce qui ne
+      // perturbe pas le cache et evite d'en accumuler un par requete.
+      const OCTETS = Buffer.byteLength(consigne, 'utf8');
+      if (OCTETS > 120000) {
+        const empreinte = createHash('sha1').update(consigne).digest('hex').slice(0, 16);
+        const chemin = path.join(DOSSIER_PROMPTS, `${empreinte}.txt`);
+        if (!existsSync(chemin)) writeFileSync(chemin, consigne, 'utf8');
+        console.log(`[sys] ${OCTETS} octets > limite argv, passe par fichier ${empreinte}`);
+        args.push('--system-prompt-file', chemin);
+      } else {
+        args.push('--system-prompt', consigne);
+      }
     }
 
     const dossier = cwdPourTopic(system);
@@ -1251,7 +1305,7 @@ async function runClaudeWithRetry(payload, onText, label, hooks = {}) {
       lastError = error;
       onText.child = guarded.child || null;
 
-      const retryable = !emitted && !error.aborted && !isFatal(error.message) && !isFatal(error.stderr);
+      const retryable = !emitted && !error.aborted && !isFatal(error.message) && !isFatal(stderrUtile(error.stderr));
       if (!retryable || attempt === MAX_ATTEMPTS) break;
 
       health.totalRetries += 1;
@@ -1391,7 +1445,7 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
       type: 'error',
       error: {
         type: error.timedOut ? 'timeout_error' : 'api_error',
-        message: (error.stderr || error.message || 'Echec du CLI claude.').trim().slice(0, 2000),
+        message: (stderrUtile(error.stderr) || error.message || 'Echec du CLI claude.').trim().slice(0, 2000),
       },
     });
   } finally {
@@ -1423,7 +1477,7 @@ async function respondJson(res, { prompt, system, spec, images, sess, model, inp
       type: 'error',
       error: {
         type: error.timedOut ? 'timeout_error' : 'api_error',
-        message: (error.stderr || error.message || 'Echec du CLI claude.').trim().slice(0, 2000),
+        message: (stderrUtile(error.stderr) || error.message || 'Echec du CLI claude.').trim().slice(0, 2000),
       },
     });
   }
