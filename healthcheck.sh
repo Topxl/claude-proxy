@@ -9,7 +9,7 @@ URL="http://localhost:8000/health"
 SERVICE="claude-proxy.service"
 
 restart() {
-  echo "claude-proxy: $1 — redemarrage"
+  echo "claude-proxy: $1 : redemarrage"
   systemctl --user restart "$SERVICE"
   exit 0
 }
@@ -34,7 +34,7 @@ status=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.
 # proxy qui travaille : la panne "degraded" attendra le passage suivant.
 running=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("running",0))' 2>/dev/null)
 if [ "${running:-0}" != "0" ]; then
-  echo "claude-proxy: ${running} tour(s) HTTP en cours — pas de redemarrage"
+  echo "claude-proxy: ${running} tour(s) HTTP en cours : pas de redemarrage"
   exit 0
 fi
 
@@ -47,14 +47,14 @@ main_pid=$(systemctl --user show "$SERVICE" -p MainPID --value 2>/dev/null)
 if [ -n "${main_pid:-}" ] && [ "${main_pid:-0}" != "0" ]; then
   enfants=$(pgrep -P "$main_pid" -x claude 2>/dev/null | wc -l)
   if [ "${enfants:-0}" -gt 0 ]; then
-    echo "claude-proxy: ${enfants} sous-agent(s) en cours — pas de redemarrage"
+    echo "claude-proxy: ${enfants} sous-agent(s) en cours : pas de redemarrage"
     exit 0
   fi
 fi
 
 if [ "$status" = "degraded" ]; then
   detail=$(printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("lastFailure",""))' 2>/dev/null)
-  restart "degrade — derniere erreur: ${detail:-inconnue}"
+  restart "degrade : derniere erreur: ${detail:-inconnue}"
 fi
 
 exit 0
