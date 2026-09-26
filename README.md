@@ -16,9 +16,17 @@ reponse au format attendu, en streaming (SSE) ou en JSON.
 
 - **Compatibilite API** : `POST /v1/messages` et `/v1/messages/count_tokens`,
   streaming SSE ou reponse JSON unique.
+- **Relais d'outils MCP** : le process `claude` survit a la reponse HTTP quand
+  il est suspendu sur un appel d'outil. L'outil est servi par le proxy lui-meme
+  via `/outil`, sans process ni socket supplementaires. Timeout 16 min.
 - **Chainage de sessions** : chaque tour est relie au precedent via `--resume`,
   reconstruit a partir de l'historique envoye par le client. La table des
   chainons survit a un redemarrage du proxy (persistee sur disque).
+- **Familles de conversation** : empreinte sur la tete du prompt systeme pour
+  separer les conversations concurrentes (ex. calcul du titre vs reponse reelle).
+  Evite les corruptions de session quand deux chaines partagent les memes messages.
+- **Kill de groupe** : `killpg(-pid)` au lieu de `child.kill()`. Emporte les
+  descendants (sous-agents, OpenCLI, Playwright) et ne laisse plus d'orphelins.
 - **Economie de contexte** : le socle systeme est restreint aux outils reellement
   utilises, les sorties d'outils sont plafonnees, les images normalisees.
 - **Dossier de travail par sujet** : un topic peut pointer vers son propre
@@ -51,7 +59,8 @@ Le proxy ecoute sur le port `8000` par defaut.
 | `PORT` | `8000` | Port d'ecoute |
 | `CLAUDE_BIN` | `claude` | Binaire du CLI |
 | `CLAUDE_SETTINGS` | `./claude-settings.json` | Reglages passes au CLI |
-| `CLAUDE_TIMEOUT_MS` | `300000` | Timeout d'un tour |
+| `CLAUDE_TIMEOUT_MS` | `300000` | Timeout d'un tour (streaming) |
+| `CLAUDE_TIMEOUT_RELAIS_MS` | `960000` | Timeout du mode relais d'outils MCP |
 | `CLAUDE_MAX_CONCURRENCY` | auto | Force le plafond de concurrence |
 | `CLAUDE_RESERVE_GB` | `6` | RAM reservee au systeme |
 | `CLAUDE_EFFORT` | vide | Niveau de raisonnement par defaut |
@@ -66,6 +75,7 @@ Le nom de modele accepte deux suffixes optionnels :
 ## Endpoints
 
 - `POST /v1/messages` (et `/anthropic/v1/messages`)
+- `POST /outil` : traitement d'outil MCP suspendu (mode relais)
 - `POST /v1/messages/count_tokens`
 - `GET /encours` : tours en vol
 - `GET /health` : etat du proxy
