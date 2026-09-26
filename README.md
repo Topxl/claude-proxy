@@ -67,10 +67,11 @@ Le proxy ecoute sur le port `8000` par defaut.
 
 ## Modele et suffixes
 
-Le nom de modele accepte deux suffixes optionnels :
+Le nom de modele accepte trois suffixes optionnels, cumulables (`opus-high-toolrelay`) :
 
 - `-<effort>` (ex. `-high`) : niveau de raisonnement.
 - `-notools` : la cible repond en texte seul, sans acces aux outils.
+- `-toolrelay` : le client execute lui-meme ses outils. Le proxy les expose au CLI en MCP et renvoie de vrais blocs `tool_use` (voir `tool-relay.js`).
 
 ## Endpoints
 
