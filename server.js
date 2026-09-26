@@ -81,9 +81,12 @@ function cwdPourTopic(system) {
 }
 
 const PORT = Number(process.env.PORT) || 8000;
+import * as toolRelay from './tool-relay.js';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CLAUDE_SETTINGS = process.env.CLAUDE_SETTINGS || path.join(HERE, 'claude-settings.json');
 const TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS) || 300_000;
+// Filet de securite du mode relais, volontairement plus long que son TTL.
+const TIMEOUT_RELAIS_MS = 16 * 60 * 1000;
 // Concurrence : dimensionnee sur la machine, pas sur une constante.
 // Chaque requete = un process `claude` complet. Le facteur limitant est la RAM,
 // pas le CPU : mesure sur vj-1, un process tient ~0,3 Go au repos et pointe
@@ -180,6 +183,18 @@ let running = 0;
 const waiting = [];
 // Process claude vivants, pour les tuer proprement a l'arret du service.
 const liveChildren = new Set();
+
+// Un `child.kill()` ne tue QUE le binaire claude : ses descendants (sous-agents,
+// opencli, python, playwright) survivent en orphelins. Le fils est donc lance
+// detache (`detached: true`), il devient chef de son groupe, et on signale le
+// groupe entier via le PID negatif. Chrome et le demon OpenCLI vivent hors de
+// ce groupe (lances par le daemon, pas par un tour) : ils sont epargnes.
+function tuerArbre(proc, signal = 'SIGKILL') {
+  if (!proc || !proc.pid) return;
+  try { process.kill(-proc.pid, signal); } catch { /* groupe deja mort */ }
+  try { proc.kill(signal); } catch { /* deja mort */ }
+}
+
 
 /*
  * Registre des tours en vol : qui parle, depuis quand, et depuis combien de
@@ -514,8 +529,26 @@ function normaliserTexte(texte) {
 }
 
 
-function empreinteAvec(messages, mode) {
+/*
+ * Famille d'une conversation : empreinte du debut du prompt systeme.
+ *
+ * Incident du 2026-09-24, topic « client 3 ». Hermes envoie en meme temps la
+ * reponse et le calcul du titre, avec le MEME premier message mais deux prompts
+ * systeme differents. Les cles ne portaient que sur les messages : au tour
+ * suivant, la conversation a repris la session du titre, et chaque reponse
+ * est devenue un {"title": ...}. La famille separe les deux chaines.
+ */
+const FAMILLE_TETE = 1000;
+
+function familleDe(system) {
+  return createHash('sha1').update(normaliserTexte(system).slice(0, FAMILLE_TETE))
+    .digest('hex').slice(0, 12);
+}
+
+function empreinteAvec(messages, mode, famille = '') {
   const h = createHash('sha1');
+  h.update(famille);
+  h.update(SEP_MSG);
   messages.forEach((m, i) => {
     const dernier = i === messages.length - 1;
     let texte = normaliserTexte(extractText(m && m.content));
@@ -530,16 +563,16 @@ function empreinteAvec(messages, mode) {
   return h.digest('hex');
 }
 
-function empreinte(messages) {
-  return empreinteAvec(messages, 'exact');
+function empreinte(messages, famille = '') {
+  return empreinteAvec(messages, 'exact', famille);
 }
 
-function clesDe(messages) {
+function clesDe(messages, famille = '') {
   if (!messages.length) return [];
   return [
-    empreinteAvec(messages, 'exact'),
-    empreinteAvec(messages, 'suffixe'),
-    empreinteAvec(messages, 'prefixe'),
+    empreinteAvec(messages, 'exact', famille),
+    empreinteAvec(messages, 'suffixe', famille),
+    empreinteAvec(messages, 'prefixe', famille),
   ];
 }
 
@@ -556,9 +589,9 @@ function clesDe(messages) {
  * l'historique prive de son dernier message. La recherche par prefixe attrape
  * le second des que le premier a bouge, sans rien perdre du contexte.
  */
-function clesEtendues(messages) {
-  const cles = clesDe(messages);
-  if (messages.length > 1) cles.push(...clesDe(messages.slice(0, -1)));
+function clesEtendues(messages, famille = '') {
+  const cles = clesDe(messages, famille);
+  if (messages.length > 1) cles.push(...clesDe(messages.slice(0, -1), famille));
   return cles;
 }
 
@@ -599,8 +632,8 @@ function diagnostiquerRupture(sigAttendue) {
   return `${base} ecart=texte idx=${commun} role=${a.r} len ${b.n}->${a.n}`;
 }
 
-function chercherSession(messages) {
-  for (const cle of clesDe(messages)) {
+function chercherSession(messages, famille = '') {
+  for (const cle of clesDe(messages, famille)) {
     const e = sessions.get(cle);
     if (e) return { cle, entry: e };
   }
@@ -659,8 +692,9 @@ function oublierSession(entry) {
  * on repart sur une session neuve avec le prompt aplati : c'est le repli voulu,
  * pas une panne.
  */
-function planifierSession(messages, promptAplati, imagesAplati, dossier) {
+function planifierSession(messages, promptAplati, imagesAplati, dossier, system = '') {
   if (!RESUME_ACTIF) return null;
+  const famille = familleDe(system);
   purgerSessions();
 
   const dernier = messages[messages.length - 1];
@@ -681,7 +715,7 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier) {
   let saut = 0;
   const profondeurMax = Math.min(SAUT_MAX + 2, messages.length - 1);
   for (let k = 2; k <= profondeurMax; k += 1) {
-    const c = chercherSession(messages.slice(0, -k));
+    const c = chercherSession(messages.slice(0, -k), famille);
     if (c) { trouve = c; saut = k - 2; break; }
   }
   const entry = trouve ? trouve.entry : null;
@@ -715,7 +749,7 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier) {
       args: ['--resume', entry.id],
       prompt: texte,
       images: imagesDernier,
-      cles: clesEtendues(messages),
+      cles: clesEtendues(messages, famille),
       sig: signature(messages),
     };
   }
@@ -728,7 +762,7 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier) {
   else if (!entry) {
     const essais = [];
     for (let k = 2; k <= profondeurMax; k += 1) {
-      const cs = clesDe(messages.slice(0, -k));
+      const cs = clesDe(messages.slice(0, -k), famille);
       essais.push(`${k}:${cs.map((c) => (sessions.has(c) ? '1' : '0')).join('')}`);
     }
     motif = `chaine-introuvable ${diagnostiquerRupture(signature(messages.slice(0, -2)))} cles=${sessions.size} essais=${essais.slice(0, 6).join(',')}`;
@@ -744,7 +778,7 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier) {
     args: ['--session-id', neuve.id],
     prompt: promptAplati,
     images: imagesAplati,
-    cles: clesEtendues(messages),
+    cles: clesEtendues(messages, famille),
     sig: signature(messages),
   };
 }
@@ -818,6 +852,12 @@ function parseModelSpec(model, body = {}) {
 
   // Suffixe `-notools` : la cible repond en texte seul, sans aucun outil.
   // Utilise par PyRIT pour que la cible ne modifie pas la machine.
+  // Suffixe `-toolrelay` : le client declare ses outils et veut les executer
+  // lui-meme. Tout le mecanisme vit dans tool-relay.js. Hermes n'envoie jamais
+  // ce suffixe, son trafic ne croise donc jamais ce code.
+  const relais = toolRelay.detecter(name);
+  if (relais.actif) name = relais.model;
+
   let noTools = false;
   if (name.toLowerCase().endsWith('-notools')) {
     noTools = true;
@@ -847,6 +887,7 @@ function parseModelSpec(model, body = {}) {
     model: MODEL_OK.test(name) ? name : '',
     effort,
     noTools,
+    relais: relais.actif,
   };
 }
 
@@ -1039,8 +1080,11 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     if (CLAUDE_SETTINGS) args.push('--settings', CLAUDE_SETTINGS);
     if (spec?.model) args.push('--model', spec.model);
     if (spec?.effort) args.push('--effort', spec.effort);
-    // Cible « texte seul » : ni outils integres, ni serveurs MCP.
-    if (spec?.noTools) {
+    // Relais d'outils : les seuls outils visibles sont ceux du client, servis
+    // par le serveur MCP que le proxy expose sur lui-meme (tool-relay.js).
+    if (spec?.relaisMcp) {
+      args.push(...toolRelay.argsCli(spec.relaisMcp, PORT));
+    } else if (spec?.noTools) {
       args.push('--tools', '');
       args.push('--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config');
       // Sans cela le CLI charge le CLAUDE.md global de VJ, dont RTK.md, qui
@@ -1098,6 +1142,9 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       cwd: dossier,
       env: { ...process.env, HERMES_TOPIC: topicDe(system) || '', HERMES_TOPIC_DIR: dossier },
       stdio: ['pipe', 'pipe', 'pipe'],
+      // Groupe de process dedie : voir tuerArbre(). Sans cela, /stop laissait
+      // vivre tous les petits-enfants du tour.
+      detached: true,
     });
     // L'unite tourne en KillMode=process pour epargner Chrome et le demon
     // OpenCLI, qui vivent dans le meme cgroup. C'est donc au proxy de tuer
@@ -1125,8 +1172,10 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timedOut = true;
-        child.kill('SIGKILL');
-      }, TIMEOUT_MS);
+        tuerArbre(child);
+        // En relais, le CLI dort pendant que le client execute l'outil :
+        // c'est le TTL du relais qui doit couper, pas ce minuteur.
+      }, spec?.relaisMcp ? TIMEOUT_RELAIS_MS : TIMEOUT_MS);
     };
     armerTimeout();
 
@@ -1272,10 +1321,32 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
 async function runClaudeWithRetry(payload, onText, label, hooks = {}) {
   health.totalCalls += 1;
   let lastError = null;
+  // Jeton pose par l'appelant : passe a true des que le client raccroche.
+  const abandon = hooks.abandon || null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    if (abandon?.actif) {
+      lastError = lastError || Object.assign(new Error('Tour abandonne par le client.'), { aborted: true });
+      break;
+    }
     let emitted = false;
     const guarded = (text) => { emitted = true; onText(text); };
+    // Relais du porte-cle. runClaude pose `.child` sur la fonction qu'il recoit,
+    // donc sur `guarded` et non sur `onText` : sans ce pont, `onText.child`
+    // restait nul et le SIGKILL du client parti ne visait rien. Les logs le
+    // disaient a chaque coupure : "fils absent".
+    Object.defineProperty(guarded, 'child', {
+      configurable: true,
+      get: () => onText.child ?? null,
+      set: (proc) => {
+        onText.child = proc || null;
+        // Le fils peut naitre apres le depart du client quand la requete a
+        // attendu un creneau : on le tue aussitot, il travaille pour personne.
+        if (proc && abandon?.actif) {
+          tuerArbre(proc);
+        }
+      },
+    });
     // En mode partiel, le contenu part via onDelta (pas onText). On marque quand
     // meme `emitted` pour NE PAS retry (et re-emettre) apres avoir deja streame.
     let guardedHooks = hooks;
@@ -1303,9 +1374,9 @@ async function runClaudeWithRetry(payload, onText, label, hooks = {}) {
       return text;
     } catch (error) {
       lastError = error;
-      onText.child = guarded.child || null;
 
-      const retryable = !emitted && !error.aborted && !isFatal(error.message) && !isFatal(stderrUtile(error.stderr));
+      const retryable = !emitted && !abandon?.actif && !error.aborted
+        && !isFatal(error.message) && !isFatal(stderrUtile(error.stderr));
       if (!retryable || attempt === MAX_ATTEMPTS) break;
 
       health.totalRetries += 1;
@@ -1391,18 +1462,21 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
   let outputText = '';
   let child = null;
   let aborted = false;
+  // Partage avec runClaudeWithRetry : coupe les relances et tue un fils tardif.
+  const abandon = { actif: false };
   // Porte-cle du process fils. runClaudeWithRetry y pose .child au spawn, qui peut
   // arriver bien apres cet appel si la requete passe par la file d'attente.
   const emit = () => {};
   const onClose = () => {
     aborted = true;
+    abandon.actif = true;
     // emit.child est la source de verite : la variable child peut encore etre nulle.
     const vise = child || emit.child || null;
     console.warn(`[coupure] client parti apres ${Date.now() - started} ms, `
       + `silence CLI ${Date.now() - lastCliActivity} ms, ${outputText.length} car emis, `
       + `keepalive x${keepaliveSent}, fils ${vise ? 'tue' : 'absent'}`);
     vol.fin('coupure', `${outputText.length} car emis, silence ${Date.now() - lastCliActivity} ms`);
-    if (vise) vise.kill('SIGKILL');
+    if (vise) tuerArbre(vise);
   };
   res.on('close', onClose);
 
@@ -1420,6 +1494,7 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
     const promise = runClaudeWithRetry({ prompt, system, spec, images, sess }, emit, 'stream', {
       onActivity: () => { lastCliActivity = Date.now(); vol.touche(outputText.length); },
       onDelta,
+      abandon,
     });
     child = emit.child || null;
     await promise;
@@ -1609,11 +1684,17 @@ async function handleMessages(req, res) {
 
   try {
     const spec = parseModelSpec(model, req.body);
-    const sess = planifierSession(messages, prompt, images, cwdPourTopic(systemText));
+    const sess = planifierSession(messages, prompt, images, cwdPourTopic(systemText), systemText);
     const payload = {
       prompt, system: systemText, spec, images, sess, model, inputTokens, started, queueNotice,
     };
-    if (stream) await respondStreaming(res, payload);
+    if (spec.relais) {
+      // Chemin a part : le process claude survit a la reponse HTTP, la file
+      // d'attente le relache quand meme puisqu'il dort sur un appel MCP.
+      await toolRelay.traiter({
+        req, res, model, prompt, system: systemText, spec, inputTokens, stream,
+      });
+    } else if (stream) await respondStreaming(res, payload);
     else await respondJson(res, payload);
   } finally {
     releaseSlot();
@@ -1623,6 +1704,12 @@ async function handleMessages(req, res) {
 // Hermes n'accepte un proxy Anthropic que si le chemin finit par /anthropic
 // (hermes_cli/runtime_provider.py::_detect_api_mode_for_url). D'ou l'alias.
 app.post(['/v1/messages', '/anthropic/v1/messages'], handleMessages);
+
+// Le serveur MCP du mode relais, servi par le proxy lui-meme : pas de process
+// ni de socket supplementaires, et l'appel d'outil se suspend dans le meme
+// espace memoire que la requete HTTP a qui il doit etre rendu.
+toolRelay.init({ runClaude, extractText, estimateTokens, messageEnvelope });
+toolRelay.monterRoute(app);
 
 app.post(['/v1/messages/count_tokens', '/anthropic/v1/messages/count_tokens'], (req, res) => {
   const { messages = [], system } = req.body || {};
@@ -1637,7 +1724,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
   process.on(signal, () => {
     console.log(`[arret] ${signal} : ${liveChildren.size} process claude a tuer.`);
     for (const child of liveChildren) {
-      try { child.kill('SIGKILL'); } catch { /* deja mort */ }
+      tuerArbre(child);
     }
     process.exit(0);
   });
