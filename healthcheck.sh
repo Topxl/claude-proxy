@@ -38,11 +38,10 @@ if [ "${running:-0}" != "0" ]; then
   exit 0
 fi
 
-# 2026-08-27 : le compteur "running" ne voit QUE les tours HTTP ouverts. Les
-# sous-agents lances en arriere-plan sont des enfants `claude` du proxy qui
-# survivent a la fin du tour qui les a lances. Trois series d'agents ont ete
-# tuees en pleine tache parce que le healthcheck a redemarre le proxy pendant
-# qu'ils travaillaient, invisibles pour lui. On compte donc les enfants reels.
+# Le compteur "running" ne voit QUE les tours HTTP ouverts. Les sous-agents
+# lances en arriere-plan sont des enfants `claude` du proxy qui survivent a la
+# fin du tour qui les a lances, et resteraient invisibles pour un redemarrage
+# lance pendant qu'ils travaillent. On compte donc les enfants reels.
 main_pid=$(systemctl --user show "$SERVICE" -p MainPID --value 2>/dev/null)
 if [ -n "${main_pid:-}" ] && [ "${main_pid:-0}" != "0" ]; then
   enfants=$(pgrep -P "$main_pid" -x claude 2>/dev/null | wc -l)

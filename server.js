@@ -27,18 +27,18 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // --- Dossier de travail par topic ------------------------------------------
 // Le CLI fige son "dossier de projet" au lancement : c'est lui qui decide quel
 // CLAUDE.md est lu et quels hooks de .claude/settings.json se declenchent. Tant
-// que tout tournait dans HERE, un topic dedie a un projet (ex. Yantra DJ) ne
-// voyait ni sa doctrine ni son hook de deploiement.
+// que tout tournait dans HERE, un topic dedie a un projet ne voyait ni sa
+// doctrine ni son hook de deploiement.
 //
 // La resolution est refaite a CHAQUE tour, jamais mise en cache : ecrire la
 // table pendant une conversation deplace donc le topic des le message suivant,
 // sans redemarrer le proxy. C'est ce qui rend le changement de dossier en
-// cours de route possible ("on passe sur passreal") et l'entree dans un dossier
-// tout neuf immediate.
+// cours de route possible ("on passe sur un autre projet") et l'entree dans
+// un dossier tout neuf immediate.
 //
 // Trois etages, du plus explicite au plus devinable :
-//   1. ~/.hermes/topics-cwd.json    { "4469": "/home/vj/Bureau/Projets/DJ" }
-//   2. ~/.hermes/qg-noms.json       { "4469": "DJ" } -> ~/Bureau/Projets/DJ
+//   1. ~/.hermes/topics-cwd.json    { "4469": "/home/vj/Bureau/Projets/MonProjet" }
+//   2. ~/.hermes/qg-noms.json       { "4469": "MonProjet" } -> ~/Bureau/Projets/MonProjet
 //      (le nom du topic sert de nom de dossier, casse ignoree : un topic
 //       nomme comme son projet n'a rien a declarer)
 //   3. HERE, le dossier du proxy.
@@ -55,7 +55,7 @@ function dossierParNom(nom) {
   if (!nom) return null;
   const direct = path.join(RACINE_PROJETS, nom);
   if (existsSync(direct)) return direct;
-  // Casse libre : le topic "Passreal" trouve le dossier "passreal".
+  // Casse libre : un topic nomme "MonProjet" trouve le dossier "monprojet".
   try {
     const cible = nom.toLowerCase();
     for (const e of readdirSync(RACINE_PROJETS, { withFileTypes: true })) {
@@ -89,8 +89,8 @@ const TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS) || 300_000;
 const TIMEOUT_RELAIS_MS = 16 * 60 * 1000;
 // Concurrence : dimensionnee sur la machine, pas sur une constante.
 // Chaque requete = un process `claude` complet. Le facteur limitant est la RAM,
-// pas le CPU : mesure sur vj-1, un process tient ~0,3 Go au repos et pointe
-// vers 0,7 Go sur une tache longue. On garde RESERVE_GB pour le systeme et le
+// pas le CPU : un process tient ~0,3 Go au repos et pointe vers 0,7 Go sur une
+// tache longue. On garde RESERVE_GB pour le systeme et le
 // reste des services, et on plafonne aussi par les coeurs pour ne pas noyer
 // l'ordonnanceur. CLAUDE_MAX_CONCURRENCY force la valeur si besoin.
 const PROCESS_GB = Number(process.env.CLAUDE_PROCESS_GB) || 0.7;
@@ -103,7 +103,7 @@ const CONCURRENCY_FLOOR = Number(process.env.CLAUDE_CONCURRENCY_FLOOR) || 3;
 // les deux cas.
 //
 // La mesure est PSI (/proc/pressure/cpu, champ `some avg10`) et non la load
-// average : mesure sur vj-1, load 55 pour 24 coeurs alors que rien n'etait
+// average : une load de 55 pour 24 coeurs peut se voir alors que rien n'etait
 // reellement bloque : la load compte l'attente disque, PSI compte le temps
 // pendant lequel une tache attend vraiment un coeur. Meme raison que
 // MemAvailable plutot que freemem.
@@ -137,10 +137,10 @@ function detectConcurrency() {
   const forced = Number(process.env.CLAUDE_MAX_CONCURRENCY);
   if (Number.isFinite(forced) && forced > 0) return Math.floor(forced);
 
-  // Volontairement pas de plafond par coeurs : mesure sur vj-1, un process
-  // `claude` tient 2-3 % de CPU parce qu'il passe son temps a attendre l'API,
-  // pas a calculer. Brider sur les coeurs limitait a 22 une machine dont la
-  // RAM en autorise 35, sans rien proteger. Les vrais garde-fous sont la RAM
+  // Volontairement pas de plafond par coeurs : un process `claude` tient
+  // 2-3 % de CPU parce qu'il passe son temps a attendre l'API, pas a
+  // calculer. Brider sur les coeurs limiterait une machine dont la RAM
+  // autorise davantage, sans rien proteger. Les vrais garde-fous sont la RAM
   // ici, memoryAllowsAnotherSlot() en continu, et le 429 de l'API en bout de
   // chaine (deja retente, voir MAX_ATTEMPTS).
   const byRam = Math.floor((os.totalmem() / 2 ** 30 - RESERVE_GB) / PROCESS_GB);
@@ -240,9 +240,10 @@ function suivre(info) {
 }
 
 // MAX_CONCURRENCY est calcule au demarrage sur la RAM totale. Mais la RAM
-// *disponible* bouge : Jellyfin qui transcode, un bounce DJ, une session
-// Claude Code. Ce garde relit MemAvailable avant chaque octroi, pour que la
-// limite suive la machine au lieu d'une photo prise au boot. Sans lui, un pic
+// *disponible* bouge : un service qui transcode, une autre appli qui
+// redemarre, une session Claude Code. Ce garde relit MemAvailable avant
+// chaque octroi, pour que la limite suive la machine au lieu d'une photo
+// prise au boot. Sans lui, un pic
 // exterieur transforme le parallelisme en OOM.
 let lastMemBlockAt = 0;
 let lastLoadBlockAt = 0;
@@ -396,7 +397,7 @@ function buildPrompt(messages) {
 /* ------------------------------------------------------------------ */
 
 /*
- * Mesure du 2026-08-26, meme conversation de 3 tours, modele haiku :
+ * Mesure sur une meme conversation de 3 tours, modele haiku :
  *   historique aplati : cache_creation 10 096 / 10 127 / 10 146 ; cache_read 0
  *   --resume          : cache_creation 10 097 /    204 /    138
  *                       cache_read          0 / 10 097 / 10 301
@@ -532,11 +533,11 @@ function normaliserTexte(texte) {
 /*
  * Famille d'une conversation : empreinte du debut du prompt systeme.
  *
- * Incident du 2026-09-24, topic « client 3 ». Hermes envoie en meme temps la
- * reponse et le calcul du titre, avec le MEME premier message mais deux prompts
- * systeme differents. Les cles ne portaient que sur les messages : au tour
- * suivant, la conversation a repris la session du titre, et chaque reponse
- * est devenue un {"title": ...}. La famille separe les deux chaines.
+ * Hermes peut envoyer en meme temps la reponse et le calcul du titre d'un
+ * topic, avec le MEME premier message mais deux prompts systeme differents.
+ * Des cles qui ne portent que sur les messages font alors reprendre au tour
+ * suivant la session du titre, et chaque reponse devient un {"title": ...}.
+ * La famille separe les deux chaines.
  */
 const FAMILLE_TETE = 1000;
 
@@ -579,8 +580,8 @@ function clesDe(messages, famille = '') {
 /*
  * Le dernier message utilisateur est volatil.
  *
- * Mesure du 27/08 : une session stockee avec un dernier message de 1159
- * caracteres se representait au tour suivant avec 185 caracteres pour ce meme
+ * Mesure : une session stockee avec un dernier message de 1159 caracteres
+ * peut se representer au tour suivant avec 185 caracteres pour ce meme
  * message. Hermes enrichit le message courant au moment de l'envoi (contexte de
  * session, rappels) puis n'en garde que le texte nu dans son historique. Toute
  * cle calculee sur ce message casse donc systematiquement au tour suivant.
@@ -908,8 +909,8 @@ const FATAL_PATTERNS = [
 // Le CLI ecrit sur stderr des avertissements qui ne sont PAS des pannes :
 // dossier non marque comme fiable, warnings de Node, mises a jour. Quand ils
 // etaient le seul contenu de stderr, ils remplacaient le vrai message d'erreur
-// et Hermes affichait "trust dialog" pour une panne de quota. Mesure du
-// 2026-09-10 : 8 des 13 echecs d'agents portaient ce faux motif.
+// et Hermes affichait "trust dialog" pour une panne de quota, un faux motif
+// frequent parmi les echecs d'agents.
 const STDERR_BENIN = [
   /^Ignoring \d+ permissions\.allow entries from/i,
   /this workspace has not been trusted/i,
@@ -966,11 +967,12 @@ const OUTILS_HERMES = process.env.CLAUDE_OUTILS
 /*
  * Groupage des appels d'outils.
  *
- * Mesure du 2026-08-26 sur 4 721 allers-retours API reels : 93,1 % ne portent
- * qu'UN seul appel d'outil, moyenne 1,07. Or chaque aller-retour relit tout le
- * contexte du tour (median 53 k de socle + prompt, avant accumulation). Le
- * nombre de boucles est donc le multiplicateur de toute la facture : 6 568
- * appels d'outils ont coute 6 132 boucles la ou 3 300 auraient suffi.
+ * Mesure sur des allers-retours API reels : la grande majorite ne portent
+ * qu'UN seul appel d'outil, moyenne proche de 1. Or chaque aller-retour relit
+ * tout le contexte du tour (median 53 k de socle + prompt, avant
+ * accumulation). Le nombre de boucles est donc le multiplicateur de toute la
+ * facture : grouper les appels d'un meme message evite une bonne part des
+ * boucles inutiles.
  *
  * Deux appels independants dans le MEME message ne coutent qu'une boucle.
  */
@@ -1052,9 +1054,9 @@ const DIRECTIVE_GROUPAGE = [
   "  se relit a chaque aller-retour du tour.",
   '- Delegue une exploration large a un sous-agent : son contexte est neuf et',
   "  seul son resultat revient ici.",
-  "- **Tout appel du tool `Agent` porte `model: \"sonnet\"`.** Mesure du 2026-08-26 :",
-  "  les sous-agents tournaient tous en opus-5 et pesaient 59 % de la depense du",
-  "  jour. Une exploration, une lecture, un audit, une recherche : `sonnet`.",
+  "- **Tout appel du tool `Agent` porte `model: \"sonnet\"`.** Un sous-agent en",
+  "  opus coute nettement plus qu'en sonnet pour le meme resultat, la plupart",
+  "  du temps. Une exploration, une lecture, un audit, une recherche : `sonnet`.",
   "  N'ecris `model: \"opus\"` que si la tache exige un raisonnement long, et",
   "  dis alors pourquoi dans le champ `description`.",
 ].join('\n');
@@ -1092,14 +1094,13 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       // alors a les ecrire en texte. Coupe aussi la fuite du contexte perso.
       args.push('--setting-sources', '');
     } else {
-      // Socle reduit. Mesure du 2026-08-26 : le toolset complet du CLI coute
-      // 38 255 tokens de contexte AVANT le premier mot, relus a chaque appel.
-      // Sur 14 jours et 8 974 appels d'outils reels, Hermes n'a utilise que
-      // Bash (90,4 %), Read (3,2 %), Agent (2,1 %), Edit (1,2 %),
-      // ToolSearch (0,8 %), Write (0,5 %), Skill (0,4 %), WebSearch, WebFetch.
+      // Socle reduit. Le toolset complet du CLI coute ~38 000 tokens de
+      // contexte AVANT le premier mot, relus a chaque appel. Sur des appels
+      // d'outils reels, Hermes n'utilise dans l'ecrasante majorite des cas que
+      // Bash, Read, Agent, Edit, ToolSearch, Write, Skill, WebSearch, WebFetch.
       // Tout le reste (Glob, Grep, TodoWrite, NotebookEdit, BashOutput...) et
-      // les 102 outils MCP (0,4 % des appels) n'ont jamais servi ou presque.
-      // Restreindre ramene le socle a 24 476 tokens : -13 779 par appel.
+      // les outils MCP n'ont jamais servi ou presque. Restreindre ramene le
+      // socle a environ 24 000 tokens, une bonne part economisee par appel.
       args.push('--tools', OUTILS_HERMES);
       args.push('--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config');
     }
@@ -1119,7 +1120,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       // Le noyau limite UN argument d'exec a MAX_ARG_STRLEN = 32 pages, soit
       // 131072 octets, quel que soit ARG_MAX. Au-dela, spawn echoue en E2BIG
       // et le tour est perdu apres 3 tentatives identiques. C'est arrive des
-      // que la bibliotheque de documents client (148 Ko) a ete injectee dans
+      // qu'une grosse bibliotheque de documents (148 Ko) a ete injectee dans
       // le prompt systeme. On bascule donc sur --system-prompt-file, que le
       // CLI accepte. Le fichier est nomme d'apres l'empreinte du contenu :
       // deux tours au meme prompt reutilisent le meme fichier, ce qui ne

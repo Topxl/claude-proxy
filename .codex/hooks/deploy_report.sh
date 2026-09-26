@@ -4,15 +4,13 @@
 # dans le contexte de Claude.
 #
 # Pourquoi ce hook existe : quand le deploiement part en arriere-plan ou depuis
-# le hook Stop, un echec ne se voit nulle part. C'est exactement le defaut qui a
-# coute trente-et-un deploiements silencieux a DJ entre juin et aout 2026, dont
-# trois nuits d'affilee. Un journal que personne n'ouvre n'est pas une alerte.
+# le hook Stop, un echec ne se voit nulle part. Un journal que personne
+# n'ouvre n'est pas une alerte.
 #
 # CE QUI PARLE, ET CE QUI SE TAIT (principe 6 du socle : alerter sur la duree,
-# pas sur l'evenement). Revu le 2026-08-26, apres avoir mesure sur DJ que le
-# deploiement part a CHAQUE Stop : annoncer chaque succes aurait ajoute une
-# ligne de contexte a chaque message de la session, pour une information que
-# personne n'attend. Donc :
+# pas sur l'evenement). Le deploiement part a CHAQUE Stop : annoncer chaque
+# succes ajouterait une ligne de contexte a chaque message de la session, pour
+# une information que personne n'attend. Donc :
 #   echec      -> annonce, une seule fois par verdict
 #   en cours   -> annonce a chaque message tant que ca tourne (info vivante)
 #   succes     -> SILENCE, sauf si le verdict precedent etait un echec, auquel
@@ -21,12 +19,12 @@
 # echec ne sert a rien. Ces trois regles sont le seul reglage entre les deux.
 #
 # DEUX CONTRATS DE FICHIER D'ETAT, tous deux acceptes en LECTURE :
-#   {"state":"done|failed|aborted|running","at":...,"reason":...}   kit, keep
-#   {"ok":true|false,"at":...,"since":...,"reason":...}             DJ
-# DJ ecrit `ok` depuis l'origine et son veilleur (scripts/deploy_watch.py, cron
-# toutes les 15 min) lit `since` dans ce meme fichier. Reecrire le contrat pour
-# faire joli aurait touche un script de mise en production ; lire les deux ne
-# touche rien. Un nouveau projet ecrit `state`.
+#   {"state":"done|failed|aborted|running","at":...,"reason":...}   ce kit
+#   {"ok":true|false,"at":...,"since":...,"reason":...}             un autre projet
+# L'autre contrat ecrit `ok` depuis l'origine, et son veilleur (cron regulier)
+# lit `since` dans ce meme fichier. Reecrire ce contrat pour faire joli aurait
+# touche un script de mise en production ; lire les deux ne touche rien. Un
+# nouveau projet ecrit `state`.
 
 set -uo pipefail
 
@@ -42,8 +40,8 @@ STATE=$(printf '%s' "$STATUS"  | grep -oP '"state"\s*:\s*"\K[^"]*'  || true)
 REASON=$(printf '%s' "$STATUS" | grep -oP '"reason"\s*:\s*"\K[^"]*' || true)
 SINCE=$(printf '%s' "$STATUS"  | grep -oP '"since"\s*:\s*"\K[^"]*'  || true)
 
-# Contrat DJ : pas de champ `state`, un booleen `ok`. Traduit vers le vocabulaire
-# du kit pour que la suite du script n'ait qu'un seul cas a traiter.
+# Autre contrat : pas de champ `state`, un booleen `ok`. Traduit vers le
+# vocabulaire du kit pour que la suite du script n'ait qu'un seul cas a traiter.
 if [ -z "$STATE" ]; then
   case "$STATUS" in
     *'"ok":true'*|*'"ok": true'*)   STATE="done" ;;

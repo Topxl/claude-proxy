@@ -3,11 +3,9 @@
 #
 # Pourquoi ce script existe
 #   Les sous-agents `claude` sont des enfants de claude-proxy.service. Un agent
-#   qui redemarre ce service tue tous ses confreres ET lui-meme : incident du
-#   2026-08-27, trois series d'agents perdues. Le garde-fou bash_guard.py
-#   refuse donc tout `systemctl restart claude-proxy` lance a la main, et
-#   renvoie ici. Ce fichier etait cite par le garde-fou sans avoir jamais ete
-#   ecrit : cree le 2026-09-10.
+#   qui redemarre ce service tue tous ses confreres ET lui-meme. Le garde-fou
+#   bash_guard.py refuse donc tout `systemctl restart claude-proxy` lance a la
+#   main, et renvoie ici.
 #
 # Ce qu'il fait
 #   Attend que plus aucun tour HTTP ne soit ouvert ET que le proxy n'ait plus

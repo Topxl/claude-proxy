@@ -8,9 +8,9 @@
 # Ne touche QUE des orphelins réels, jamais une session encore ouverte :
 #   - process Chrome/playwright-mcp dont le parent est mort (PPID=1)
 #   - dossiers /tmp/playwright_chromiumdev_profile-* sans AUCUN process dessus
-# pkill est interdit (cf bash_guard.py, 79 incidents) : ici on ne tue que du
-# vraiment mort, un PID exact à la fois, jamais une session encore attachée
-# à un process claude vivant (impossible de savoir si elle sert encore).
+# pkill est interdit (cf bash_guard.py) : ici on ne tue que du vraiment mort,
+# un PID exact à la fois, jamais une session encore attachée à un process
+# claude vivant (impossible de savoir si elle sert encore).
 set -uo pipefail
 
 killed=0

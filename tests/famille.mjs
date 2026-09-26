@@ -1,6 +1,6 @@
-// Incident du 2026-09-24 : le calcul du titre et la reponse partent ensemble,
-// meme premier message, prompts systeme differents. Le tour suivant ne doit
-// jamais reprendre la session du titre.
+// Le calcul du titre et la reponse peuvent partir ensemble, meme premier
+// message, prompts systeme differents. Le tour suivant ne doit jamais
+// reprendre la session du titre.
 const U = 'http://127.0.0.1:8978/v1/messages';
 const post = async (system, messages) => {
   const r = await fetch(U, { method: 'POST', headers: { 'content-type': 'application/json' },

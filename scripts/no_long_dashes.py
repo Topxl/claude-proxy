@@ -105,15 +105,14 @@ def _tracked_files(root: Path, scope: list[str] | None = None) -> list[Path]:
 def main() -> int:
     """Sans argument de chemin : tout le suivi. Avec : ce périmètre seulement.
 
-    Le périmètre existe pour les dépôts CLONÉS d'un amont tiers. Mesuré le
-    2026-08-26 en portant le socle : `autodan-turbo` (clone d'un dépôt
-    académique) porte 11 932 tirets longs et `claude-code-best-practice` 2 440,
-    tous écrits en amont. Les réécrire mettrait le dépôt en conflit à chaque
-    `git pull`, pour une typographie dont nous ne sommes pas l'auteur, et le
-    contrôle passerait sa vie au rouge : un filet qu'on n'ose plus lancer ne
-    protège plus rien. La règle des tirets vaut pour ce que NOUS écrivons ;
-    sur un clone, `check.sh` passe donc la liste des chemins qui sont à nous,
-    et son en-tête dit lesquels et pourquoi.
+    Le périmètre existe pour les dépôts CLONÉS d'un amont tiers : un clone
+    d'un dépôt tiers porte souvent des milliers de tirets longs écrits en
+    amont. Les réécrire mettrait le dépôt en conflit à chaque `git pull`,
+    pour une typographie dont nous ne sommes pas l'auteur, et le contrôle
+    passerait sa vie au rouge : un filet qu'on n'ose plus lancer ne protège
+    plus rien. La règle des tirets vaut pour ce que NOUS écrivons ; sur un
+    clone, `check.sh` passe donc la liste des chemins qui sont à nous, et
+    son en-tête dit lesquels et pourquoi.
     """
     check_only = "--check" in sys.argv
     scope = [a for a in sys.argv[1:] if not a.startswith("-")]

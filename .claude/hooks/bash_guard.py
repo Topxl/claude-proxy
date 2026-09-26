@@ -12,10 +12,10 @@ Exit 2 + message sur stderr = l'appel est bloqué, et Claude lit le message.
 Chaque message porte le remède, pas seulement l'interdit : un garde-fou qui dit
 « non » sans dire « fais plutôt ceci » se fait contourner.
 
-Socle de départ, repris tel quel de DJ et de passreal. Ce qui suit est ce qui
-vaut pour n'importe quel projet. Tout ce qui est propre à CELUI-CI (adresse de
+Socle de départ, repris tel quel d'autres dépôts. Ce qui suit est ce qui vaut
+pour n'importe quel projet. Tout ce qui est propre à CELUI-CI (adresse de
 prod, nom d'unité systemd, pile docker, migrations) s'ajoute dans le bloc
-« Règles propres au projet », avec sa date et son incident.
+« Règles propres au projet ». Chaque règle dit en une ligne ce qu'elle empêche.
 """
 
 import json
@@ -47,11 +47,11 @@ if re.search(r"scripts/(deploy|check_prod_parity|check)[a-z_]*\.sh", cmd):
     sys.exit(0)
 
 # ── pkill ────────────────────────────────────────────────────────────────────
-# 79 incidents mesurés sur DJ : la commande s'auto-tue, ou tue le Chrome de
-# Playwright que la session était en train de piloter.
+# Un pkill par nom de process s'auto-tue, ou tue le Chrome de Playwright que
+# la session est en train de piloter.
 if re.search(r"\bpkill\b", cmd):
     deny(
-        "pkill interdit (79 incidents : s'auto-tue, ou tue le Chrome de "
+        "pkill interdit (s'auto-tue, ou tue le Chrome de "
         "Playwright). Viser un PID explicite : lsof -i:PORT puis kill <pid>, "
         "ou TaskStop pour une tâche du harnais."
     )
@@ -69,11 +69,11 @@ if re.search(r"\b(sk_live_|rk_live_|whsec_|ghp_|xoxb-)[0-9A-Za-z]{10,}", cmd):
     )
 
 # ── Effacements catastrophiques ─────────────────────────────────────────────
-# Remplace la règle `ask` sur « rm * », retirée du settings.json le 2026-08-07.
-# Une règle `ask` interrompt à chaque fois, y compris pour effacer un fichier
-# temporaire ; mesurée sur le projet DJ, elle a demandé confirmation 753 fois
-# sans avoir jamais rien empêché. Un garde-fou qu'on accepte toujours entraîne
-# à valider sans lire, ce qui le rend pire qu'inutile. Ici on ne vise que ce
+# Remplace une règle `ask` sur « rm * ». Une règle `ask` interrompt à chaque
+# fois, y compris pour effacer un fichier temporaire, et finit par demander
+# une confirmation systématique sans jamais rien empêcher. Un garde-fou qu'on
+# accepte toujours entraîne à valider sans lire, ce qui le rend pire
+# qu'inutile. Ici on ne vise que ce
 # qu'un motif par préfixe ne sait pas exprimer : la racine, le home, une
 # arborescence système, ou un chemin réduit à un seul niveau, signe habituel
 # d'une variable vide en préfixe.
@@ -105,13 +105,10 @@ for _seg in re.split(r"&&|\|\||;|\n|\|", cmd):
             )
 
         # ── Variable non protégée en TÊTE de chemin ──────────────────────────
-        # VARIABLE_NUE_EN_TETE. Posé dans le kit le 2026-08-27, après mesure :
-        # « rm -rf "$D"/ » est le cas que methodes/socle-projet.md cite comme
-        # CIBLE VISÉE de tout ce bloc, et il passait sur les 10 projets qui
-        # portent la copie générique du kit. La règle existait dans DJ,
-        # passreal, readcommons et keep depuis le 2026-08-26, mais n'était
-        # jamais remontée ici : une correction posée dans les copies et pas
-        # dans la source ne se propage pas, c'est le principe 14 pris en défaut.
+        # VARIABLE_NUE_EN_TETE. « rm -rf "$D"/ » est le cas que
+        # methodes/socle-projet.md cite comme cible visée de tout ce bloc : une
+        # variable vide en tête de chemin fait remonter l'effacement vers la
+        # racine, et le motif par préfixe seul ne le détecte pas.
         #
         # Le hook voit la commande AVANT substitution : « $D » n'est qu'un
         # texte, donc aucune liste de chemins ne peut le reconnaître.
@@ -187,31 +184,27 @@ for _seg in re.split(r"&&|\|\||;|\n|\|", cmd):
 #   une ancienne adresse IP de serveur, réattribuée depuis
 #       -> y envoyer quoi que ce soit livre le code à un tiers
 #   lancer le serveur à la main / npm run dev sur un port déjà pris
-#       -> 411 relances mesurées, et on teste un VIEUX build sans le savoir
+#       -> on relance un serveur déjà en route, et on teste un vieux build
+#          sans le savoir
 #
-# Chaque règle ajoutée porte sa DATE et son INCIDENT. Rien pour le style.
+# Chaque règle dit en une ligne ce qu'elle empêche. Rien pour le style.
 
-# 2026-08-27 : suicide collectif des sous-agents.
-# Incident : quatre sous-agents lances en parallele sur le projet keep sont
-# morts trois fois de suite en pleine tache, perdant des heures de travail.
-# Cause : les sous-agents `claude` sont des enfants de claude-proxy.service.
-# Un agent qui redemarre ce service (ou hermes-gateway, qui l'entraine) tue
-# donc tous ses confreres ET lui-meme. Deux sauvegardes d'unite datees du jour
-# le prouvent : .bak-autocompact et .bak-cache-ttl.
+# Suicide collectif des sous-agents : les sous-agents `claude` sont des
+# enfants de claude-proxy.service. Un agent qui redemarre ce service (ou
+# hermes-gateway, qui l'entraine) tue donc tous ses confreres ET lui-meme.
 # Remede : editer l'unite, puis demander a VJ de la recharger, ou passer par
 # scripts/redemarrer-au-calme.sh qui attend la fin des tours.
 _SERVICES_VITAUX = ("claude-proxy", "hermes-gateway")
 if re.search(r"\bsystemctl\b", cmd) and re.search(
     r"\b(restart|stop|kill|reload-or-restart|try-restart)\b", cmd
 ):
-    # Les instances distantes (claude-proxy-distant sur le Pi) n'hebergent
+    # Les instances distantes suffixées (claude-proxy-<nom>) n'hebergent
     # aucun sous-agent de cette machine : elles ne sont pas vitales ici.
     for _svc in _SERVICES_VITAUX:
-        if re.search(re.escape(_svc) + r"(?!-client)", cmd):
+        if re.search(re.escape(_svc) + r"(?![-\w])", cmd):
             deny(
                 f"« {_svc} » heberge les sous-agents en cours : le redemarrer "
                 "les tue tous, y compris celui qui lance la commande. "
-                "Incident du 2026-08-27, trois series d'agents perdues. "
                 "Edite l'unite si tu veux, mais laisse VJ la recharger."
             )
 

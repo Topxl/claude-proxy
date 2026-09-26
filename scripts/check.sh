@@ -116,7 +116,7 @@ if [ "$CIBLE" = "all" ] || [ "$CIBLE" = "py" ] || [ "$CIBLE" = "--fast" ]; then
   # Lint d'abord : un import mort se voit en 2 s, inutile de payer la suite.
   # Le jeu de règles est dans pyproject.toml. Une règle ne passe en `ignore`
   # que pour une raison écrite : taire du bruit aveugle le linter, et c'est
-  # comme ça que 22 vrais noms non définis sont partis en prod sur DJ.
+  # comme ça que de vrais noms non définis peuvent partir en prod.
   # Un outil absent n'est pas un contrôle vert : ce serait exactement le
   # mensonge qu'on répare. Il compte pour un échec, et le message porte le remède.
   outil_absent() { ! "$PY" -m "$1" --version >/dev/null 2>&1; }
