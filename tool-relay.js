@@ -251,6 +251,15 @@ function prochainEvenement(session) {
 /* Point d'entree                                                      */
 /* ------------------------------------------------------------------ */
 
+/** Blocs image Anthropic (base64) d'un contenu de tool_result, au format MCP. */
+function imagesMcp(contenu) {
+  if (!Array.isArray(contenu)) return [];
+  return contenu
+    .filter((b) => b && b.type === 'image' && b.source && b.source.type === 'base64'
+      && typeof b.source.data === 'string')
+    .map((b) => ({ type: 'image', data: b.source.data, mimeType: b.source.media_type || 'image/png' }));
+}
+
 /** Le dernier message du client porte-t-il des resultats d'outils ? */
 function resultatsDuClient(messages) {
   const dernier = messages[messages.length - 1];
@@ -282,11 +291,17 @@ async function traiter({ req, res, model, prompt, system, spec, inputTokens, str
       const [appel] = session.appels.splice(i, 1);
       parToolUseId.delete(appel.toolUseId);
       const texte = deps.extractText(r.content);
+      // Les images du resultat (attach_image, captures) passent en blocs MCP
+      // image : sinon le modele ne recoit que le texte « Loaded ».
+      const images = imagesMcp(r.content);
+      const contenu = [];
+      if (texte || !images.length) contenu.push({ type: 'text', text: texte });
+      contenu.push(...images);
       envoyerSse(appel.res, { jsonrpc: '2.0', id: appel.rpcId, result: {
-        content: [{ type: 'text', text: texte }],
+        content: contenu,
         isError: Boolean(r.is_error),
       }});
-      console.log(`[relais ${session.sid}] resultat ${appel.nom} (${texte.length} car)`);
+      console.log(`[relais ${session.sid}] resultat ${appel.nom} (${texte.length} car, ${images.length} image(s))`);
     }
     await attendreEtRepondre(session, res, model, inputTokens, stream);
     return;
