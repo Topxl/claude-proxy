@@ -2,6 +2,16 @@
 
 Les dates sont celles des commits. Le détail vit dans `git log`.
 
+## 2026-10-07
+
+- 2026-10-11 : `tests/relais-topic.sh` couvre le chemin du QG (topic lu dans le cadre ajouté par l'api_server). Réglage côté `contexte/bin/qg/qg-envoyer.sh`.
+- 2026-10-10 : relais d'outils par topic Hermes (`~/.hermes/topics-relais.json`), sans suffixe `-toolrelay`. Test `tests/relais-topic.sh`.
+- **Messages en plein tour** (`POST /steer`) : le CLI tourne en `--input-format stream-json --replay-user-messages`, stdin reste ouvert. Un message de VJ arrive dans le tour en vol au lieu d'attendre sa fin. Stdin se ferme au `result` qui suit le dernier message lu. Usage additionne sur les tours enchaines. Cote Hermes : plugin `steer-proxy`.
+- **Message pendant un sous-agent au premier plan** : le proxy coupe le tour (`control_request` interrupt), attend son `result`, puis ecrit le message comme tour suivant. Avant, le message attendait la fin du sous-agent (15 min sur Marwell 2). Test reel : `tests/steer-coupe-reel.sh`.
+- **Faux CLI de test** : partent des la 1re ligne en stream-json, comme le vrai.
+- **Revue memoire d'Hermes en copie** : la revue lancee en fond apres un tour (« Review the conversation above... ») reprend la session en `--fork-session`. Elle volait la chaine du topic, et le message suivant de VJ partait sur une session plus ancienne, sans les derniers echanges (topic 635, 18:06). Test `tests/annexe.sh`.
+- **Repli par signature** : seulement sur la session la plus recente du topic.
+
 ## 2026-09-26
 
 - **Relais d'outils MCP** (`tool-relay.js`, suffixe `-toolrelay`) : le client déclare ses propres outils. Le proxy les expose au CLI en MCP et renvoie de vrais blocs `tool_use`. Le processus `claude` reste suspendu sur l'appel, puis reprend quand le client poste le résultat sur `POST /outil`.

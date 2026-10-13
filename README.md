@@ -79,6 +79,7 @@ Le nom de modele accepte trois suffixes optionnels, cumulables (`opus-high-toolr
 - `POST /outil` : traitement d'outil MCP suspendu (mode relais)
 - `POST /v1/messages/count_tokens`
 - `GET /encours` : tours en vol
+- `POST /steer` `{topic, texte}` : message arrive pendant un tour, ecrit sur le stdin du CLI de ce topic. 200 = injecte, 409 = aucun tour en vol (le client garde sa file). Le CLI le lit au prochain resultat d'outil, ou enchaine un tour dans le meme process : une seule reponse. `PROXY_STEER=0` coupe. Test reel : `tests/steer-reel.sh` contre un proxy de test.
 - `GET /health` : etat du proxy
 
 ## Licence
