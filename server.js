@@ -7,7 +7,7 @@ import os from 'node:os';
 import {
   readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, readdirSync,
 } from 'node:fs';
-import { unlinkSync, statSync } from 'node:fs';
+import { unlinkSync, statSync, appendFile } from 'node:fs';
 
 // Prompts systeme trop gros pour argv (voir E2BIG plus bas). Purge au
 // demarrage de tout ce qui date de plus de 24 h : ces fichiers ne servent
@@ -45,6 +45,33 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Un dossier absent ou illisible retombe a l'etage suivant, jamais d'echec dur.
 const TABLE_CWD = path.join(os.homedir(), '.hermes', 'topics-cwd.json');
 const TABLE_NOMS = path.join(os.homedir(), '.hermes', 'qg-noms.json');
+// Topics Hermes passes en relais d'outils (2026-10-10). Liste d'ids de thread,
+// relue a chaque requete : ajouter ou retirer un topic ne demande aucun
+// redemarrage. Voir topicEnRelais().
+const TABLE_RELAIS = path.join(os.homedir(), '.hermes', 'topics-relais.json');
+// Consommation reelle : une ligne JSON par appel du CLI, lue par
+// ~/.claude/outils/conso-hermes.py. Les chiffres viennent de l'evenement
+// `result` du CLI (usage + total_cost_usd), pas d'une estimation chars/4.
+const FICHIER_USAGE = process.env.PROXY_USAGE_LOG
+  || path.join(os.homedir(), '.hermes', 'proxy-usage.jsonl');
+
+function journaliserUsage(ligne) {
+  try {
+    mkdirSync(path.dirname(FICHIER_USAGE), { recursive: true });
+    appendFile(FICHIER_USAGE, `${JSON.stringify(ligne)}\n`, (e) => {
+      if (e) console.warn('[usage] ecriture impossible:', e.message);
+    });
+  } catch (e) { console.warn('[usage] ecriture impossible:', e.message); }
+}
+
+// Nature de l'appel. Un cron Hermes porte cette phrase dans son prompt ;
+// un topic Telegram porte `thread: N` dans le prompt systeme.
+function sourceDe(system, prompt) {
+  if (/You are running as a scheduled cron job/.test(prompt || '')) return 'cron';
+  if (topicDe(system)) return 'topic';
+  if (/\*\*Source:\*\*/.test(system || '')) return 'chat';
+  return 'auxiliaire';
+}
 const RACINE_PROJETS = path.join(os.homedir(), 'Bureau', 'Projets');
 
 function lireJson(fichier) {
@@ -70,6 +97,13 @@ function dossierParNom(nom) {
 function topicDe(system) {
   const m = system && /thread:\s*(\d+)/.exec(system);
   return m ? m[1] : null;
+}
+
+function topicEnRelais(system) {
+  const topic = topicDe(system);
+  if (!topic) return false;
+  const liste = lireJson(TABLE_RELAIS);
+  return Array.isArray(liste) && liste.map(String).includes(topic);
 }
 
 function cwdPourTopic(system) {
@@ -189,10 +223,68 @@ const liveChildren = new Set();
 // detache (`detached: true`), il devient chef de son groupe, et on signale le
 // groupe entier via le PID negatif. Chrome et le demon OpenCLI vivent hors de
 // ce groupe (lances par le daemon, pas par un tour) : ils sont epargnes.
-function tuerArbre(proc, signal = 'SIGKILL') {
+//
+// Le groupe ne suffit pas (mesure du 2026-10-03) : Claude Code lance chaque
+// commande Bash sous setsid, dans sa propre session et son propre groupe. Un
+// /stop tuait le CLI mais laissait finir les scripts en cours (opencli, python,
+// curl en boucle). On releve donc tous les descendants AVANT de tuer : une fois
+// le parent mort, ils sont reparentes a systemd et la filiation est perdue.
+//
+// `toutLeTour` va plus loin, pour un /stop seulement : tout process dont
+// l'environnement porte le PROXY_TOUR de ce tour, meme detache par setsid
+// (agent-fond, nohup ... &). Les demons partages (Chrome, demon OpenCLI) qu'un
+// tour aurait demarres en premier sont epargnes : d'autres tours s'en servent.
+const DEMONS_PARTAGES = /chrome|chromium|opencli\/dist\/src\/daemon|--chrome-native-host|claude-mem/;
+
+function lireProc(pid, fichier) {
+  try { return readFileSync(`/proc/${pid}/${fichier}`, 'utf8'); } catch { return ''; }
+}
+
+function pidsVivants() {
+  try { return readdirSync('/proc').filter((n) => /^\d+$/.test(n)).map(Number); } catch { return []; }
+}
+
+function descendants(racine) {
+  const enfants = new Map();
+  for (const pid of pidsVivants()) {
+    // Le nom du process (2e champ) peut contenir des espaces : on coupe apres la parenthese.
+    const stat = lireProc(pid, 'stat');
+    const ppid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+    if (!enfants.has(ppid)) enfants.set(ppid, []);
+    enfants.get(ppid).push(pid);
+  }
+  const vus = [];
+  const pile = [racine];
+  while (pile.length) {
+    const p = pile.pop();
+    for (const e of enfants.get(p) || []) { vus.push(e); pile.push(e); }
+  }
+  return vus;
+}
+
+function taguesDuTour(tour) {
+  if (!tour) return [];
+  const marque = `PROXY_TOUR=${tour}`;
+  return pidsVivants().filter((pid) => {
+    if (pid === process.pid) return false;
+    if (!lireProc(pid, 'environ').split('\0').includes(marque)) return false;
+    return !DEMONS_PARTAGES.test(lireProc(pid, 'cmdline').replace(/\0/g, ' '));
+  });
+}
+
+function tuerArbre(proc, signal = 'SIGKILL', { toutLeTour = false } = {}) {
   if (!proc || !proc.pid) return;
+  const cibles = new Set(descendants(proc.pid));
+  if (toutLeTour) for (const pid of taguesDuTour(proc.tour)) cibles.add(pid);
+  cibles.delete(process.pid);
   try { process.kill(-proc.pid, signal); } catch { /* groupe deja mort */ }
   try { proc.kill(signal); } catch { /* deja mort */ }
+  for (const pid of cibles) {
+    // Un chef de groupe emporte ses petits-enfants restes dans son groupe.
+    try { process.kill(-pid, signal); } catch { /* pas chef de groupe */ }
+    try { process.kill(pid, signal); } catch { /* deja mort */ }
+  }
+  if (cibles.size) console.warn(`[tuer] ${cibles.size} process hors groupe tues${toutLeTour ? ' (tout le tour)' : ''}`);
 }
 
 
@@ -642,6 +734,74 @@ function chercherSession(messages, famille = '') {
 }
 
 /*
+ * Repli quand les cles ne retrouvent rien : comparaison message par message,
+ * limitee au meme topic, sans la famille.
+ *
+ * Mesure du 2026-10-05, topic 8164 : apres un /stop, Hermes renvoie le meme
+ * historique, mais la tete de son prompt systeme a change (tete4k 1c37fb6f ->
+ * 3acf87db). La famille entre dans chaque cle : plus aucune ne matche, et le
+ * tour repart en session neuve avec 582 000 caracteres aplatis, sans le
+ * travail fait avant le stop.
+ *
+ * On accepte une session du meme topic dont tout l'historique stocke se
+ * retrouve en tete du nouveau, sauf au plus son dernier message utilisateur
+ * (la version enrichie, qu'Hermes raccourcit dans son historique). Le nouvel
+ * historique doit le contenir encore, sous sa forme courte : un message
+ * remplace ou rejoue (/retry, /undo) ne passe donc pas.
+ */
+/*
+ * Appels annexes d'Hermes (2026-10-07).
+ *
+ * Apres un tour, Hermes lance en fond une revue (memoire, skills) avec le MEME
+ * prompt systeme et le MEME historique, plus une consigne. Elle retrouvait donc
+ * la session du topic et la reprenait : la chaine passait sous les cles de la
+ * revue, et le vrai message suivant de VJ ne la retrouvait plus. Le repli par
+ * signature prenait alors une session plus ancienne du meme topic, qui n'avait
+ * pas vu les derniers echanges (topic 635, 18:05 : « Oui active » repondu hors
+ * contexte). La revue part desormais sur une COPIE de la session
+ * (`--fork-session`) et la chaine reste intacte.
+ */
+const PREFIXES_ANNEXES = [
+  'Review the conversation above and update the skill library',
+  'Review the conversation above and consider saving to memory',
+];
+function estAnnexe(texte) {
+  const t = String(texte || '').trimStart();
+  return PREFIXES_ANNEXES.some((p) => t.startsWith(p));
+}
+
+function chercherParSignature(messages, topic) {
+  if (!topic || messages.length < 3) return null;
+  const sigAttendue = signature(messages.slice(0, -1));
+  /*
+   * Une session plus ancienne qu'une autre du meme topic n'a pas vu les tours
+   * de celle-ci : les reprendre ferait sauter des echanges entiers, compte a
+   * tort comme des messages d'outils du CLI. On n'accepte que la plus recente.
+   */
+  let plusRecent = 0;
+  for (const e of new Set(sessions.values())) if (e.topic === topic && e.ts > plusRecent) plusRecent = e.ts;
+  let meilleur = null;
+  for (const e of new Set(sessions.values())) {
+    if (e.topic !== topic || !Array.isArray(e.sig) || e.sig.length < 3) continue;
+    if (e.ts < plusRecent) continue;
+    if (e.sig.length > sigAttendue.length) continue;
+    if (sigAttendue.length - e.sig.length > SAUT_MAX) continue;
+    let i = 0;
+    while (i < e.sig.length && e.sig[i].h === sigAttendue[i].h && e.sig[i].r === sigAttendue[i].r) i += 1;
+    if (i < e.sig.length - 1) continue;
+    if (i === e.sig.length - 1) {
+      const stocke = e.sig[i];
+      const recu = sigAttendue[i];
+      if (stocke.r !== 'user' || recu.r !== 'user' || recu.n > stocke.n) continue;
+    }
+    if (!meilleur || e.sig.length > meilleur.entry.sig.length) {
+      meilleur = { entry: e, saut: sigAttendue.length - e.sig.length };
+    }
+  }
+  return meilleur;
+}
+
+/*
  * Purge par entree, pas par cle.
  *
  * Chaque session est indexee sous trois cles. L'ancienne eviction supprimait la
@@ -676,6 +836,26 @@ function purgerSessions() {
  * meurt en plein tour, le tour suivant retrouve la chaine du tour precedent.
  */
 const enCours = new Map();
+
+// Avec --resume, le CLI rend un cout et un modelUsage CUMULES sur toute la session,
+// alors que `usage` est celui du seul tour. On garde le dernier cumul par session
+// pour journaliser la difference : sinon chaque tour repris recompte les precedents.
+const cumulsSession = new Map();
+function deltaSession(sid, total, parModele) {
+  const avant = sid ? cumulsSession.get(sid) : null;
+  if (sid) {
+    cumulsSession.delete(sid);
+    cumulsSession.set(sid, { total, parModele: JSON.parse(JSON.stringify(parModele)) });
+    if (cumulsSession.size > 500) cumulsSession.delete(cumulsSession.keys().next().value);
+  }
+  if (!avant) return total;
+  for (const [m, v] of Object.entries(parModele)) {
+    const p = avant.parModele[m];
+    if (!p) continue;
+    for (const k of Object.keys(v)) v[k] = Math.max(0, v[k] - (p[k] || 0));
+  }
+  return Math.max(0, total - avant.total);
+}
 
 function oublierSession(entry) {
   for (const [cle, e] of sessions) if (e === entry) sessions.delete(cle);
@@ -719,6 +899,12 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier, system 
     const c = chercherSession(messages.slice(0, -k), famille);
     if (c) { trouve = c; saut = k - 2; break; }
   }
+  const topic = topicDe(system);
+  let parSignature = false;
+  if (!trouve) {
+    const repli = chercherParSignature(messages, topic);
+    if (repli) { trouve = repli; saut = repli.saut; parSignature = true; }
+  }
   const entry = trouve ? trouve.entry : null;
   const texte = extractText(dernier && dernier.content);
   const imagesDernier = extractImages([dernier]);
@@ -739,14 +925,29 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier, system 
     && (texte || imagesDernier.length),
   );
 
+  if (reprenable && estAnnexe(texte)) {
+    console.log(`[sess] annexe : copie de ${entry.id} (--fork-session), chaine intacte`);
+    return {
+      entry: { id: entry.id, tours: entry.tours, ts: Date.now(), dir: dossier, topic },
+      annexe: true,
+      topic,
+      args: ['--resume', entry.id, '--fork-session'],
+      prompt: texte,
+      images: imagesDernier,
+      cles: [],
+      sig: null,
+    };
+  }
+
   if (reprenable) {
     const clesDepart = [...sessions].filter(([, e]) => e === entry).map(([c]) => c);
     oublierSession(entry);
     enCours.set(entry, clesDepart);
     entry.busy = true;
-    console.log(`[sess] reprise ${entry.id} tour ${entry.tours + 1} : ${texte.length} car au lieu de ${promptAplati.length}${saut ? ` (saut=${saut} msgs d'outils du CLI)` : ''}`);
+    console.log(`[sess] reprise ${entry.id} tour ${entry.tours + 1} : ${texte.length} car au lieu de ${promptAplati.length}${saut ? ` (saut=${saut} msgs d'outils du CLI)` : ''}${parSignature ? ' (repli signature, topic ' + topic + ')' : ''}`);
     return {
       entry,
+      topic,
       args: ['--resume', entry.id],
       prompt: texte,
       images: imagesDernier,
@@ -756,7 +957,7 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier, system 
   }
 
   const neuve = {
-    id: randomUUID(), tours: 0, busy: true, ts: Date.now(), dir: dossier,
+    id: randomUUID(), tours: 0, busy: true, ts: Date.now(), dir: dossier, topic,
   };
   let motif;
   if (messages.length < 3) motif = 'debut-conversation';
@@ -776,6 +977,7 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier, system 
   console.log(`[sess] neuve ${neuve.id} motif=${motif} msgs=${messages.length}`);
   return {
     entry: neuve,
+    topic,
     args: ['--session-id', neuve.id],
     prompt: promptAplati,
     images: imagesAplati,
@@ -785,12 +987,14 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier, system 
 }
 
 function validerSession(sess) {
-  if (!sess) return;
+  if (!sess || sess.annexe) return;
   enCours.delete(sess.entry);
   sess.entry.busy = false;
   sess.entry.tours += 1;
   sess.entry.ts = Date.now();
   if (Array.isArray(sess.sig)) sess.entry.sig = sess.sig;
+  // Les sessions anterieures au repli par signature n'ont pas de topic.
+  if (sess.topic) sess.entry.topic = sess.topic;
   for (const cle of sess.cles) sessions.set(cle, sess.entry);
   planifierSauvegarde();
 }
@@ -800,7 +1004,7 @@ function validerSession(sess) {
  * message utilisateur dans son journal, reprendre dessus le dupliquerait.
  */
 function abandonnerSession(sess) {
-  if (!sess) return;
+  if (!sess || sess.annexe) return;
   enCours.delete(sess.entry);
   sess.entry.busy = false;
   oublierSession(sess.entry);
@@ -812,6 +1016,30 @@ function estimateTokens(text) {
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const MODEL_OK = /^(claude-[a-z0-9.-]+|opus|sonnet|haiku|fable)(\[1m\])?$/i;
+
+// Fable n'est voulu nulle part (VJ, 2026-10-04) : le topic Phone y etait reste
+// accroche par un /model oublie, 433 etapes en un jour. Tout appel Fable part en Opus.
+const MODELE_INTERDIT = /fable/i;
+const MODELE_REPLI = 'claude-opus-5-5';
+
+function sansModeleInterdit(name) {
+  if (!MODELE_INTERDIT.test(name)) return name;
+  console.warn(`[modele] ${name} refuse, remplace par ${MODELE_REPLI}`);
+  return MODELE_REPLI;
+}
+
+// Garde-fou de modele pour Prime Agent. COUPE par defaut : VJ garde Prime en
+// Opus effort medium (2026-10-04). `PRIME_MODELE=sonnet` le rallume : tout appel
+// `-toolrelay` plus lourd que Sonnet (sous-agents `rlm.spawn(model=...)` et
+// compactage compris) est alors ramene a ce modele.
+const PRIME_MODELE = process.env.PRIME_MODELE ?? '';
+const PRIME_TROP_LOURD = /opus|fable/i;
+
+function modelePrime(name) {
+  if (!PRIME_MODELE || !PRIME_TROP_LOURD.test(name)) return name;
+  console.warn(`[modele] Prime ${name} ramene a ${PRIME_MODELE}`);
+  return PRIME_MODELE;
+}
 
 // Hermes connait deux niveaux que le CLI ignore : "minimal" et "ultra".
 const EFFORT_ALIASES = { minimal: 'low', ultra: 'max' };
@@ -857,9 +1085,30 @@ function parseModelSpec(model, body = {}) {
   // lui-meme. Tout le mecanisme vit dans tool-relay.js. Hermes n'envoie jamais
   // ce suffixe, son trafic ne croise donc jamais ce code.
   const relais = toolRelay.detecter(name);
+  // Relais par topic (2026-10-10) : un topic Hermes liste dans
+  // ~/.hermes/topics-relais.json passe en relais sans changer son modele.
+  // Hermes y retrouve sa propre boucle d'outils (budget, kanban, todo,
+  // delegate_task, cron). Seulement si des outils sont declares : le
+  // compactage d'Hermes, sans outils, reste sur le chemin normal.
+  let parTopic = false;
+  if (!relais.actif && Array.isArray(body.tools) && body.tools.length
+      && topicEnRelais(extractText(body.system))) {
+    relais.actif = true;
+    parTopic = true;
+  }
   if (relais.actif) name = relais.model;
 
   let noTools = false;
+  // Relais demande, mais aucun outil declare : c'est le compactage du client
+  // (Prime Agent resume son historique sans outils). Avant le 2026-10-03, le
+  // relais refusait en 400 : 512 echecs en 7 j, l'historique de Prime n'etait
+  // jamais resume et chaque session repartait a ~313k tokens. On repond donc
+  // en texte seul, comme `-notools`.
+  let relaisActif = relais.actif;
+  if (relaisActif && !(Array.isArray(body.tools) && body.tools.length)) {
+    relaisActif = false;
+    noTools = true;
+  }
   if (name.toLowerCase().endsWith('-notools')) {
     noTools = true;
     name = name.slice(0, -'-notools'.length);
@@ -884,11 +1133,16 @@ function parseModelSpec(model, body = {}) {
       || suffixEffort
       || normalizeEffort(process.env.CLAUDE_EFFORT);
 
+  if (relais.actif && !parTopic) name = modelePrime(name);
+
   return {
-    model: MODEL_OK.test(name) ? name : '',
+    model: MODEL_OK.test(name) ? sansModeleInterdit(name) : '',
     effort,
     noTools,
-    relais: relais.actif,
+    relais: relaisActif,
+    // Seul Prime Agent envoie `-toolrelay` : ses appels (compactage compris)
+    // sortent sous leur propre source dans proxy-usage.jsonl.
+    client: parTopic ? 'hermes-relais' : (relais.actif ? 'prime' : ''),
   };
 }
 
@@ -1030,6 +1284,17 @@ function filtreOutilStream() {
   };
 }
 
+// La carte generale (contexte/INDEX.md) arrivait 2 fois a chaque etape : recopiee
+// par synchroniser.sh dans SOUL.md, donc dans le prompt systeme d'Hermes, et
+// importee par ~/.claude/CLAUDE.md, que le CLI charge de toute facon. 3,9 k
+// tokens relus pour rien a chaque etape, et la copie de SOUL.md etait en retard
+// (2026-10-04). On retire le bloc ici, sur le seul chemin qui passe par le CLI :
+// un modele servi sans CLI garde sa carte.
+const BLOC_CONTEXTE = /<!-- CONTEXTE:DEBUT[\s\S]*?<!-- CONTEXTE:FIN -->\n?/;
+function sansBlocContexte(texte) {
+  return texte.replace(BLOC_CONTEXTE, '');
+}
+
 const DIRECTIVE_GROUPAGE = [
   '',
   '## Economie de contexte (imperatif)',
@@ -1061,6 +1326,47 @@ const DIRECTIVE_GROUPAGE = [
   "  dis alors pourquoi dans le champ `description`.",
 ].join('\n');
 
+/*
+ * Messages en plein tour (steer). Le CLI lance en `--input-format stream-json`
+ * lit stdin tant qu'il reste ouvert : un message utilisateur ecrit pendant le
+ * tour est lu au prochain resultat d'outil, dans le MEME tour. Ecrit apres le
+ * `result`, il ouvre un tour de plus dans le meme process. Le proxy garde donc
+ * stdin ouvert et ne le ferme qu'au `result` qui suit le dernier message lu
+ * (le CLI le renvoie, grace a --replay-user-messages, au moment ou il le lit).
+ * Cle : le topic Telegram, tire du prompt systeme. POST /steer y ecrit.
+ */
+const STEER_ACTIF = process.env.PROXY_STEER !== '0';
+const pilotables = new Map();
+
+function texteSteer(texte) {
+  return `[Message de VJ arrive PENDANT le tour en cours]\n${texte}\n[/Message]\n`
+    + "S'il corrige ou precise la tache en cours, change de cap tout de suite. "
+    + "S'il est independant, lance-le en parallele (sous-agent en arriere-plan) "
+    + 'sans abandonner la tache en cours, puis reponds aux deux.';
+}
+
+/*
+ * 2026-10-07, topic Marwell 2 : VJ ecrit « ne fais pas ces recherches » pendant
+ * qu'un sous-agent portail tourne au premier plan. Le CLI ne lit stdin qu'au
+ * prochain resultat d'outil, donc apres le retour du sous-agent : 15 min de
+ * recherche que VJ venait d'annuler. Desormais, un message qui arrive pendant
+ * un sous-agent au premier plan coupe le tour (control_request interrupt), puis
+ * part comme tour suivant, dans le meme process et la meme session.
+ * Teste en CLI reel : l'interruption tue le sous-agent en moins d'une seconde.
+ * Le message s'ecrit APRES le `result` de l'interruption : ecrit avant, il est
+ * annule avec le tour.
+ */
+function texteSteerCoupe(texte) {
+  return `[Message de VJ arrive PENDANT le tour en cours]\n${texte}\n[/Message]\n`
+    + 'Ton sous-agent au premier plan a ete coupe pour que tu lises ce message tout de suite. '
+    + "S'il corrige ou annule la tache, applique-le et dis en 1 ligne ce que tu as coupe. "
+    + "S'il est independant, relance le sous-agent coupe puis reponds au message.";
+}
+
+function estAgentPremierPlan(b) {
+  return b?.type === 'tool_use' && (b.name === 'Agent' || b.name === 'Task') && !b.input?.run_in_background;
+}
+
 function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks = {}) {
   const onActivity = typeof hooks.onActivity === 'function' ? hooks.onActivity : () => {};
   // Mode PARTIEL (temps reel) : present seulement pour le stream. Emet les deltas
@@ -1068,6 +1374,10 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
   const onDelta = typeof hooks.onDelta === 'function' ? hooks.onDelta : null;
   // Relais NATIF (stream) : renvoyer les vrais events SSE du CLI tels quels.
   const onEvent = typeof hooks.onEvent === 'function' ? hooks.onEvent : null;
+  // Fil en direct d'un tour de mission (cron Hermes, cron/fil_direct.py) : le
+  // prompt porte <<FIL-DIRECT>>, on emet alors le journal d'outils pour ce tour
+  // seulement. Hermes retire ces lignes du rapport final.
+  const trace = STREAM_TRACE || (typeof prompt === 'string' && prompt.includes('<<FIL-DIRECT>>'));
   return new Promise((resolve, reject) => {
     const args = ['-p', '--output-format', 'stream-json', '--verbose'];
     // Continuite : --session-id ouvre un journal CLI nomme, --resume le
@@ -1077,7 +1387,12 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     // Une image ne passe pas par stdin texte : il faut le format d'entree
     // structure, seul moyen de donner des blocs `image` au CLI.
     const avecImages = Array.isArray(images) && images.length > 0;
-    if (avecImages) args.push('--input-format', 'stream-json');
+    // Pilotable : un topic identifie et des outils (sans outils, le tour est
+    // un seul appel, il n'y a rien a corriger en route).
+    const topicTour = topicDe(system);
+    const pilotable = STEER_ACTIF && !!topicTour && !spec?.noTools && !spec?.relaisMcp;
+    if (avecImages || pilotable) args.push('--input-format', 'stream-json');
+    if (pilotable) args.push('--replay-user-messages');
     if (onDelta || onEvent) args.push('--include-partial-messages');
     if (CLAUDE_SETTINGS) args.push('--settings', CLAUDE_SETTINGS);
     if (spec?.model) args.push('--model', spec.model);
@@ -1104,6 +1419,8 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       args.push('--tools', OUTILS_HERMES);
       args.push('--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config');
     }
+    let hTout = '';
+    let hTete = '';
     if (system) {
       // Diagnostic cache : le system prompt est le PREMIER bloc mis en cache par
       // le CLI. S'il change d'un tour a l'autre, tout ce qui suit est invalide,
@@ -1111,12 +1428,13 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       // recalcule a chaque tour un bloc "ephemeral" (contexte de session) qu'il
       // colle au prompt systeme stable : on trace donc separement l'empreinte
       // du tout et celle des 4 premiers kilo-octets.
-      const hTout = createHash('sha1').update(system).digest('hex').slice(0, 8);
-      const hTete = createHash('sha1').update(system.slice(0, 4000)).digest('hex').slice(0, 8);
+      hTout = createHash('sha1').update(system).digest('hex').slice(0, 8);
+      hTete = createHash('sha1').update(system.slice(0, 4000)).digest('hex').slice(0, 8);
       console.log(`[sys] len=${system.length} tout=${hTout} tete4k=${hTete}`);
       // La directive de groupage parle d'appels d'outils : la coller a une
       // cible qui n'en a aucun lui apprend justement a en fabriquer en texte.
-      const consigne = spec?.noTools ? system : `${system}\n${DIRECTIVE_GROUPAGE}`;
+      const base = sansBlocContexte(system);
+      const consigne = spec?.noTools ? base : `${base}\n${DIRECTIVE_GROUPAGE}`;
       // Le noyau limite UN argument d'exec a MAX_ARG_STRLEN = 32 pages, soit
       // 131072 octets, quel que soit ARG_MAX. Au-dela, spawn echoue en E2BIG
       // et le tour est perdu apres 3 tentatives identiques. C'est arrive des
@@ -1139,9 +1457,14 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
 
     const dossier = cwdPourTopic(system);
     if (dossier !== HERE) console.log(`[cwd] ${dossier}`);
+    // Marque du tour, heritee par tout ce qu'il lance, meme sous setsid : un
+    // /stop retrouve ainsi les process detaches (voir tuerArbre).
+    const tour = randomUUID();
     const child = spawn(CLAUDE_BIN, args, {
       cwd: dossier,
-      env: { ...process.env, HERMES_TOPIC: topicDe(system) || '', HERMES_TOPIC_DIR: dossier },
+      env: {
+        ...process.env, HERMES_TOPIC: topicDe(system) || '', HERMES_TOPIC_DIR: dossier, PROXY_TOUR: tour,
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
       // Groupe de process dedie : voir tuerArbre(). Sans cela, /stop laissait
       // vivre tous les petits-enfants du tour.
@@ -1150,6 +1473,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     // L'unite tourne en KillMode=process pour epargner Chrome et le demon
     // OpenCLI, qui vivent dans le meme cgroup. C'est donc au proxy de tuer
     // ses propres enfants a l'arret, sinon ils survivent en orphelins.
+    child.tour = tour;
     liveChildren.add(child);
     child.once('close', () => liveChildren.delete(child));
 
@@ -1164,6 +1488,26 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     // Journal d'outils compact (une ligne par appel, dedupe).
     let toolEnCours = null;
     let dernierOutil = '';
+    // Consommation : evenement `result` du CLI et outils appeles par nom.
+    let resultat = null;
+    const resultats = [];
+    // Pilote du tour : messages ecrits sur stdin et pas encore lus par le CLI.
+    // agents : sous-agents au premier plan en cours (ids tool_use). coupure :
+    // messages a ecrire des que le `result` de l'interruption est arrive.
+    const pilote = pilotable
+      ? { child: null, attendus: [], ferme: false, recus: 0, agents: new Set(), coupure: null }
+      : null;
+    let aSeparer = false;
+    let outilDepuisTexte = false;
+    const fermerStdin = () => {
+      if (!pilote || pilote.ferme) return;
+      pilote.ferme = true;
+      if (pilotables.get(topicTour) === pilote) pilotables.delete(topicTour);
+      try { child.stdin.end(); } catch {}
+    };
+    const outils = {};
+    const skills = {};
+    const debut = Date.now();
 
     // Timeout d'INACTIVITE, pas de mur d'horloge. Un tour qui travaille encore
     // (appels d'outils, texte qui sort) ne doit jamais etre tue : c'est ce qui
@@ -1190,9 +1534,18 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
           const cb = e.content_block || {};
           toolEnCours = cb.type === 'tool_use'
             ? { name: cb.name || 'outil', input: '' } : null;
+          // Texte d'attente puis reponse, separes par un outil : sans ligne
+          // vide ils se collent (« je te reponds.Voici ») et le titre du
+          // rapport QG reprend la phrase d'attente.
+          if (cb.type === 'tool_use') outilDepuisTexte = true;
+          else if (cb.type === 'text' && outilDepuisTexte) { outilDepuisTexte = false; aSeparer = true; }
         } else if (e.type === 'content_block_delta') {
           const d = e.delta || {};
           if (d.type === 'text_delta' && d.text) {
+            if (aSeparer) {
+              aSeparer = false;
+              if (full.trim()) { full += '\n\n'; onDelta('\n\n'); }
+            }
             full += d.text;
             const sortie = filtre ? filtre.push(d.text) : d.text;
             if (sortie) onDelta(sortie);
@@ -1200,12 +1553,59 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
           else if (d.type === 'input_json_delta' && toolEnCours && d.partial_json) {
             toolEnCours.input += d.partial_json;
           }
-        } else if (e.type === 'content_block_stop' && toolEnCours && STREAM_TRACE) {
+        } else if (e.type === 'content_block_stop' && toolEnCours && trace) {
           const ligne = ligneOutil(toolEnCours.name, toolEnCours.input);
           if (ligne && ligne !== dernierOutil) { dernierOutil = ligne; onDelta(`${ligne}\n`); }
           toolEnCours = null;
         }
         return;
+      }
+      if (pilote && !evt.parent_tool_use_id && Array.isArray(evt.message?.content)) {
+        for (const b of evt.message.content) {
+          if (evt.type === 'assistant' && estAgentPremierPlan(b)) pilote.agents.add(b.id);
+          if (evt.type === 'user' && b?.type === 'tool_result') pilote.agents.delete(b.tool_use_id);
+        }
+      }
+      if (pilote && pilote.coupure && evt.type === 'result') {
+        // Fin du tour coupe (error_during_execution) : ce n'est pas une panne.
+        resultats.push(evt);
+        const messages = pilote.coupure;
+        pilote.coupure = null;
+        pilote.agents.clear();
+        aSeparer = true;
+        for (const contenu of messages) {
+          pilote.attendus.push(contenu);
+          child.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: contenu } })}\n`);
+        }
+        console.log(`[steer] topic=${topicTour} tour coupe, ${messages.length} message(s) envoye(s)`);
+        return;
+      }
+      if (pilote && evt.type === 'user' && typeof evt.message?.content === 'string') {
+        const i = pilote.attendus.indexOf(evt.message.content);
+        if (i !== -1) {
+          pilote.attendus.splice(i, 1);
+          console.log(`[steer] topic=${topicTour} message lu par le CLI`);
+        }
+      }
+      if (evt.type === 'result') {
+        resultat = evt;
+        resultats.push(evt);
+        if (pilote) {
+          // Un message ecrit mais pas encore lu ouvrira un tour de plus.
+          if (pilote.attendus.length && !evt.is_error) aSeparer = true;
+          else fermerStdin();
+        }
+      }
+      if (evt.type === 'assistant' && Array.isArray(evt.message?.content)) {
+        for (const b of evt.message.content) {
+          if (b?.type !== 'tool_use') continue;
+          outils[b.name || 'outil'] = (outils[b.name || 'outil'] || 0) + 1;
+          // Skill chargee : par l'outil Skill, ou par lecture de son SKILL.md.
+          const chemin = String(b.input?.file_path || b.input?.command || '');
+          const nomSkill = b.name === 'Skill' ? b.input?.skill
+            : (chemin.match(/skills\/(?:[^/\s]+\/)*?([^/\s]+)\/SKILL\.md/) || [])[1];
+          if (nomSkill) skills[nomSkill] = (skills[nomSkill] || 0) + 1;
+        }
       }
       if (evt.type === 'assistant') {
         // Une erreur d'auth ou d'API arrive dans un message assistant marque.
@@ -1266,6 +1666,55 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      if (pilote) { pilote.ferme = true; if (pilotables.get(topicTour) === pilote) pilotables.delete(topicTour); }
+      // Plusieurs tours dans le meme process (steer) : additionner leur usage.
+      if (resultats.length > 1) {
+        const somme = {};
+        for (const r of resultats) {
+          for (const [k, v] of Object.entries(r.usage || {})) if (typeof v === 'number') somme[k] = (somme[k] || 0) + v;
+        }
+        resultat = { ...resultat, usage: { ...resultat.usage, ...somme },
+          num_turns: resultats.reduce((n, r) => n + (r.num_turns || 0), 0) };
+      }
+      const u = resultat?.usage || {};
+      const parModele = {};
+      for (const [m, v] of Object.entries(resultat?.modelUsage || {})) {
+        parModele[m] = {
+          entree: v.inputTokens || 0, sortie: v.outputTokens || 0,
+          cache_lu: v.cacheReadInputTokens || 0, cache_ecrit: v.cacheCreationInputTokens || 0,
+          cout_usd: v.costUSD || 0,
+        };
+      }
+      const coutTour = deltaSession(resultat?.session_id, resultat?.total_cost_usd || 0, parModele);
+      journaliserUsage({
+        ts: new Date(debut).toISOString(),
+        ms: Date.now() - debut,
+        source: spec?.client || sourceDe(system, prompt),
+        topic: topicDe(system) || null,
+        tour,
+        session: resultat?.session_id || null,
+        reprise: Array.isArray(sessionArgs) && sessionArgs.includes('--resume'),
+        modele: spec?.model || null,
+        effort: spec?.effort || null,
+        cwd: dossier,
+        sys_len: system ? system.length : 0,
+        sys_tout: hTout,
+        sys_tete: hTete,
+        prompt_len: (prompt || '').length,
+        prompt_debut: (prompt || '').slice(0, 120),
+        entree: u.input_tokens || 0,
+        sortie: u.output_tokens || 0,
+        cache_lu: u.cache_read_input_tokens || 0,
+        cache_ecrit: u.cache_creation_input_tokens || 0,
+        cout_usd: coutTour,
+        tours_cli: resultat?.num_turns || 0,
+        outils,
+        skills,
+        par_modele: parModele,
+        statut: timedOut ? 'timeout' : (failure ? 'erreur' : (resultat ? 'ok' : 'sans_result')),
+        code,
+      });
+      if (typeof hooks.onUsage === 'function' && resultat?.usage) hooks.onUsage(resultat.usage);
       if (timedOut) {
         // Du texte a deja ete produit : le rendre vaut mieux que le silence.
         if (full.trim()) {
@@ -1298,11 +1747,19 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     });
 
     child.stdin.on('error', () => {});
-    if (avecImages) {
+    if (avecImages || pilotable) {
       const blocs = [];
       if (prompt) blocs.push({ type: 'text', text: prompt });
-      blocs.push(...images);
-      child.stdin.end(`${JSON.stringify({ type: 'user', message: { role: 'user', content: blocs } })}\n`);
+      if (avecImages) blocs.push(...images);
+      const ligne = `${JSON.stringify({ type: 'user', message: { role: 'user', content: blocs } })}\n`;
+      if (pilote) {
+        child.stdin.write(ligne);
+        pilote.child = child;
+        // Un tour plus recent sur le meme topic prend la main.
+        pilotables.set(topicTour, pilote);
+      } else {
+        child.stdin.end(ligne);
+      }
     } else {
       child.stdin.end(prompt);
     }
@@ -1344,7 +1801,7 @@ async function runClaudeWithRetry(payload, onText, label, hooks = {}) {
         // Le fils peut naitre apres le depart du client quand la requete a
         // attendu un creneau : on le tue aussitot, il travaille pour personne.
         if (proc && abandon?.actif) {
-          tuerArbre(proc);
+          tuerArbre(proc, 'SIGKILL', { toutLeTour: true });
         }
       },
     });
@@ -1477,7 +1934,7 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
       + `silence CLI ${Date.now() - lastCliActivity} ms, ${outputText.length} car emis, `
       + `keepalive x${keepaliveSent}, fils ${vise ? 'tue' : 'absent'}`);
     vol.fin('coupure', `${outputText.length} car emis, silence ${Date.now() - lastCliActivity} ms`);
-    if (vise) tuerArbre(vise);
+    if (vise) tuerArbre(vise, 'SIGKILL', { toutLeTour: true });
   };
   res.on('close', onClose);
 
@@ -1492,9 +1949,14 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
         type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text },
       });
     };
+    // Sortie reelle du CLI, rendue a Hermes au lieu de l'estimation chars/4.
+    // L'entree reste estimee : le vrai contexte du CLI (cache compris) ferait
+    // croire a Hermes que sa propre fenetre est pleine.
+    let vraiUsage = null;
     const promise = runClaudeWithRetry({ prompt, system, spec, images, sess }, emit, 'stream', {
       onActivity: () => { lastCliActivity = Date.now(); vol.touche(outputText.length); },
       onDelta,
+      onUsage: (u) => { vraiUsage = u; },
       abandon,
     });
     child = emit.child || null;
@@ -1504,7 +1966,7 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
     send('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: 'end_turn', stop_sequence: null },
-      usage: { output_tokens: estimateTokens(outputText) },
+      usage: { output_tokens: vraiUsage?.output_tokens ?? estimateTokens(outputText) },
     });
     send('message_stop', { type: 'message_stop' });
     console.log(`[stream] ${spec.model || 'defaut'}/${spec.effort || 'defaut'} ${prompt.length} car -> ${outputText.length} car en ${Date.now() - started} ms (keepalive x${keepaliveSent})`);
@@ -1538,14 +2000,17 @@ async function respondStreaming(res, { prompt, system, spec, images, sess, model
 async function respondJson(res, { prompt, system, spec, images, sess, model, inputTokens, started, queueNotice }) {
   try {
     const collect = () => {};
-    const raw = await runClaudeWithRetry({ prompt, system, spec, images, sess }, collect, 'json');
+    let vraiUsage = null;
+    const raw = await runClaudeWithRetry({ prompt, system, spec, images, sess }, collect, 'json', {
+      onUsage: (u) => { vraiUsage = u; },
+    });
     const text = queueNotice ? queueNotice + raw : raw;
     console.log(`[json] ${prompt.length} car -> ${text.length} car en ${Date.now() - started} ms`);
     res.json({
       ...messageEnvelope({ model, inputTokens }),
       content: [{ type: 'text', text }],
       stop_reason: 'end_turn',
-      usage: { input_tokens: inputTokens, output_tokens: estimateTokens(text) },
+      usage: { input_tokens: inputTokens, output_tokens: vraiUsage?.output_tokens ?? estimateTokens(text) },
     });
   } catch (error) {
     console.error(`[json] echec en ${Date.now() - started} ms: ${error.message}`);
@@ -1576,6 +2041,35 @@ app.get(['/health', '/anthropic/health'], (_req, res) => {
     cpuPressureCeiling: CPU_PRESSURE_CEILING,
     ...health,
   });
+});
+
+// Message arrive pendant un tour : ecrit sur le stdin du CLI de ce topic.
+// 409 = aucun tour pilotable en vol, le client garde alors sa file normale.
+app.post(['/steer', '/anthropic/steer'], (req, res) => {
+  const topic = String(req.body?.topic ?? '');
+  const texte = String(req.body?.texte ?? '').trim();
+  const p = pilotables.get(topic);
+  if (!texte || !p || p.ferme || !p.child || p.child.exitCode !== null) {
+    res.status(409).json({ ok: false, raison: texte ? 'aucun tour en vol' : 'texte vide' });
+    return;
+  }
+  p.recus += 1;
+  if (p.coupure || p.agents.size) {
+    const premier = !p.coupure;
+    p.coupure = p.coupure || [];
+    p.coupure.push(texteSteerCoupe(texte));
+    if (premier) {
+      p.child.stdin.write(`${JSON.stringify({ type: 'control_request', request_id: `coupe-${Date.now()}`, request: { subtype: 'interrupt' } })}\n`);
+    }
+    console.log(`[steer] topic=${topic} sous-agent au premier plan : coupure (${texte.length} car.)`);
+    res.json({ ok: true, coupe: true });
+    return;
+  }
+  const contenu = texteSteer(texte);
+  p.attendus.push(contenu);
+  p.child.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: contenu } })}\n`);
+  console.log(`[steer] topic=${topic} injecte (${texte.length} car.)`);
+  res.json({ ok: true });
 });
 
 app.get(['/encours', '/anthropic/encours'], (_req, res) => {

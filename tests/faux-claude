@@ -1,9 +1,18 @@
 #!/usr/bin/env node
+// Comme le vrai CLI en --input-format stream-json : il part des la 1re ligne
+// lue, sans attendre la fin de stdin (le proxy la garde ouverte pour /steer).
+const __flux = process.argv[process.argv.indexOf('--input-format') + 1] === 'stream-json';
+const quandPret = (f) => {
+  let fait = false;
+  const go = () => { if (!fait) { fait = true; f(); } };
+  process.stdin.on('end', go);
+  if (__flux) process.stdin.on('data', (d) => { if (String(d).includes('\n')) go(); });
+};
 // Faux CLI claude pour les tests du chainage : emet un stream-json minimal.
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 let stdin = '';
 process.stdin.on('data', (d) => { stdin += d; });
-process.stdin.on('end', () => {
+quandPret(() => {
   out({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } });
   out({ type: 'result', subtype: 'success', result: 'ok', usage: { input_tokens: 1, output_tokens: 1 } });
   process.exit(0);

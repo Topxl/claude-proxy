@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+// Comme le vrai CLI en --input-format stream-json : il part des la 1re ligne
+// lue, sans attendre la fin de stdin (le proxy la garde ouverte pour /steer).
+const __flux = process.argv[process.argv.indexOf('--input-format') + 1] === 'stream-json';
+const quandPret = (f) => {
+  let fait = false;
+  const go = () => { if (!fait) { fait = true; f(); } };
+  process.stdin.on('end', go);
+  if (__flux) process.stdin.on('data', (d) => { if (String(d).includes('\n')) go(); });
+};
+// Faux CLI : un appel d'outil en stream (tool_use + input_json_delta), puis du texte.
+const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+const ev = (event) => out({ type: 'stream_event', event });
+process.stdin.on('data', () => {});
+quandPret(() => {
+  ev({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', name: 'Bash' } });
+  ev({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"command":"date"}' } });
+  ev({ type: 'content_block_stop', index: 0 });
+  ev({ type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } });
+  ev({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Rapport fini.' } });
+  ev({ type: 'content_block_stop', index: 1 });
+  out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Rapport fini.' }] } });
+  out({ type: 'result', subtype: 'success', result: 'Rapport fini.', session_id: 's-fil', num_turns: 2,
+    usage: { input_tokens: 1, output_tokens: 3 } });
+  process.exit(0);
+});

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Faux CLI claude pour tests/stop.sh : lance 3 process qui echappent au groupe,
+# comme Claude Code (Bash sous setsid) et agent-fond (detache, reparente a 1),
+# puis travaille sans fin jusqu'a ce que le proxy le tue.
+cat > /dev/null
+setsid sleep 301 &                                         # commande Bash en cours
+setsid bash -c 'sleep 302 & disown' &                      # agent-fond : reparente a 1
+setsid bash -c 'exec -a opencli/dist/src/daemon.js sleep 303 & disown' &  # demon partage
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"travail..."}]}}'
+sleep 600

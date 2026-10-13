@@ -36,6 +36,69 @@ let deps = null;
 const sessions = new Map();     // sid -> session
 const parToolUseId = new Map(); // tool_use_id -> sid
 
+/*
+ * Reprise d'un tour a l'autre (2026-10-04).
+ * Chaque nouveau tour du client relancait un `claude` neuf avec TOUT son
+ * historique aplati en un seul message. Ce bloc change a chaque tour, donc
+ * le cache de prefixe ne le retrouvait jamais : mesure sur 7 j, 85 % du cout
+ * de Prime etait de l'ecriture de cache, 97 % de celle-ci au 1er appel du tour
+ * (~170 a 480k tokens repayes a chaque message de VJ).
+ *
+ * Le CLI garde deja ce tour dans son journal. A la fin d'un tour, on retient
+ * l'empreinte des messages de la derniere requete et l'id de session CLI. Si
+ * la requete suivante = ces messages + la reponse finale + un message neuf,
+ * on fait `--resume` avec ce seul message. Tout ecart (compactage du client,
+ * historique retouche, autre prompt systeme) retombe sur l'historique aplati,
+ * comme avant : rien ne se perd, seul le cache est repaye.
+ */
+const REPRISE_ACTIVE = process.env.RELAIS_REPRISE !== '0';
+const REPRISE_TTL_MS = 6 * 60 * 60 * 1000;
+const REPRISE_TOURS_MAX = 100;
+const reprises = new Map();     // empreinte des messages -> { id, sys, tours, ts }
+
+/** Forme stable d'un message : sans cache_control ni blocs de raisonnement. */
+function canonique(m) {
+  const c = m && m.content;
+  const blocs = typeof c === 'string' ? [{ type: 'text', text: c }] : (Array.isArray(c) ? c : []);
+  return [m && m.role, blocs.map((b) => {
+    if (!b || b.type === 'thinking' || b.type === 'redacted_thinking') return null;
+    if (b.type === 'text') return ['t', b.text];
+    if (b.type === 'tool_use') return ['u', b.id, b.name, b.input];
+    if (b.type === 'tool_result') return ['r', b.tool_use_id, deps.extractText(b.content)];
+    if (b.type === 'image') return ['i', String(b.source?.data || b.source?.url || '').length];
+    return [b.type];
+  }).filter(Boolean)];
+}
+
+function empreinte(messages) {
+  return crypto.createHash('sha1').update(JSON.stringify(messages.map(canonique))).digest('hex');
+}
+
+function empreinteSys(system) {
+  return crypto.createHash('sha1').update(String(system || '')).digest('hex');
+}
+
+function purgerReprises() {
+  const limite = Date.now() - REPRISE_TTL_MS;
+  for (const [cle, r] of reprises) if (r.ts < limite) reprises.delete(cle);
+  while (reprises.size > 200) reprises.delete(reprises.keys().next().value);
+}
+
+/** La requete prolonge-t-elle un tour termine ? Rend { id, tours, texte } ou null. */
+function chercherReprise(messages, system) {
+  if (!REPRISE_ACTIVE || messages.length < 3) return null;
+  purgerReprises();
+  const dernier = messages[messages.length - 1];
+  if (!dernier || dernier.role !== 'user' || messages[messages.length - 2]?.role !== 'assistant') return null;
+  const texte = deps.extractText(dernier.content);
+  if (!texte) return null;
+  const cle = empreinte(messages.slice(0, -2));
+  const r = reprises.get(cle);
+  if (!r || r.sys !== empreinteSys(system) || r.tours >= REPRISE_TOURS_MAX) return null;
+  reprises.delete(cle);
+  return { id: r.id, tours: r.tours, texte };
+}
+
 function init(d) { deps = d; }
 
 /** Le suffixe `-toolrelay` demande-t-il le relais ? */
@@ -303,7 +366,7 @@ async function traiter({ req, res, model, prompt, system, spec, inputTokens, str
       }});
       console.log(`[relais ${session.sid}] resultat ${appel.nom} (${texte.length} car, ${images.length} image(s))`);
     }
-    await attendreEtRepondre(session, res, model, inputTokens, stream);
+    await attendreEtRepondre(session, res, model, inputTokens, stream, messages);
     return;
   }
 
@@ -317,31 +380,37 @@ async function traiter({ req, res, model, prompt, system, spec, inputTokens, str
     return;
   }
   const sid = nouvelId('rel');
+  const reprise = chercherReprise(messages, system);
   const session = {
     sid, outils, appels: [], timerGroupage: null, timerTtl: null,
     rendreLesAppels: null, texteCumule: '',
+    cliId: reprise ? reprise.id : crypto.randomUUID(),
+    tours: reprise ? reprise.tours + 1 : 1,
+    sys: empreinteSys(system),
   };
   sessions.set(sid, session);
   armerTtl(session);
-  console.log(`[relais ${sid}] demarrage, ${outils.length} outils du client, modele ${model}`);
+  console.log(`[relais ${sid}] demarrage, ${outils.length} outils du client, modele ${model}`
+    + (reprise ? `, reprise ${reprise.id} tour ${session.tours} : ${reprise.texte.length} car au lieu de ${prompt.length}`
+      : `, session neuve ${session.cliId} (${prompt.length} car)`));
 
   session.promesseCli = deps.runClaude(
     {
-      prompt,
+      prompt: reprise ? reprise.texte : prompt,
       system,
       spec: { ...spec, relaisMcp: { sid, noms: outils.map((o) => o.name) } },
       images: [],
-      sessionArgs: [],
+      sessionArgs: reprise ? ['--resume', reprise.id] : ['--session-id', session.cliId],
     },
     (t) => { session.texteCumule += t; },
   );
   // Un echec du CLI ne doit pas remonter en rejet non gere avant qu'on l'attende.
   session.promesseCli.catch(() => {});
 
-  await attendreEtRepondre(session, res, model, inputTokens, stream);
+  await attendreEtRepondre(session, res, model, inputTokens, stream, messages);
 }
 
-async function attendreEtRepondre(session, res, model, inputTokens, stream) {
+async function attendreEtRepondre(session, res, model, inputTokens, stream, messages) {
   const avant = session.texteCumule.length;
   const ev = await prochainEvenement(session);
 
@@ -352,6 +421,10 @@ async function attendreEtRepondre(session, res, model, inputTokens, stream) {
   }
   if (ev.type === 'fin') {
     const texte = ev.texte || session.texteCumule;
+    // Le tour suivant pourra reprendre cette session CLI (voir chercherReprise).
+    if (REPRISE_ACTIVE) {
+      reprises.set(empreinte(messages), { id: session.cliId, sys: session.sys, tours: session.tours, ts: Date.now() });
+    }
     fermerSession(session, 'terminee');
     repondre(res, corpsFinal(texte, model, inputTokens), stream);
     return;
@@ -378,4 +451,4 @@ function argsCli(relaisMcp, port) {
   ];
 }
 
-export { init, detecter, monterRoute, traiter, argsCli, SUFFIXE, sessions };
+export { init, detecter, monterRoute, traiter, argsCli, SUFFIXE, sessions, reprises };
