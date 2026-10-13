@@ -10,7 +10,7 @@ while :; do
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("running",0))' 2>/dev/null)
   [ "${running:-1}" = "0" ] && break
   [ $(( $(date +%s) - debut )) -ge "$LIMITE" ] && { echo "attente depassee, redemarrage force"; break; }
-  sleep 10
+  sleep 2
 done
 systemctl --user restart claude-proxy.service
 echo "claude-proxy redemarre a $(date +%H:%M:%S)"

@@ -1,4 +1,11 @@
 {
   "_commentaire": "Hooks actifs pour RTK. Les hooks sonores et de renommage sont neutralises cote ~/.claude/settings.json par la garde CLAUDE_TIMEOUT_MS.",
-  "disableAllHooks": false
+  "disableAllHooks": false,
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": false,
+    "claude-hud@claude-hud": false
+  },
+  "_plugins": "2026-10-06 : seuls claude-hud (barre d'etat, sans objet en -p) et frontend-design (jamais appele par Hermes) sont coupes ici. claude-mem et token-optimizer restent : le 1er enregistre le travail d'Hermes, le 2e restaure le contexte apres compaction.",
+  "outputStyle": "default",
+  "_outputStyle": "2026-10-07 : le style clair arrive par la personnalite Hermes (generee depuis ~/.claude/output-styles/clair.md par contexte/bin/style-clair.py). L'output style est coupe ici pour ne pas l'envoyer 2 fois."
 }
