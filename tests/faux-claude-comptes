@@ -1,0 +1,20 @@
+#!/usr/bin/env node
+// Faux CLI pour tests/comptes.sh : le jeton « jeton-plein » rend la limite
+// des 5 h, tout autre jeton repond « ok:<jeton> ». Note chaque jeton recu.
+import fs from 'node:fs';
+const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+const jeton = process.env.CLAUDE_CODE_OAUTH_TOKEN || 'aucun';
+fs.appendFileSync(process.env.FAUX_TRACE, `${jeton}\n`);
+process.stdin.resume();
+const go = () => {
+  if (jeton === 'jeton-plein') {
+    out({ type: 'assistant', is_api_error_message: true, message: { content: [{ type: 'text', text: "You've hit your 5-hour limit · resets 10:40pm (Asia/Bangkok)" }] } });
+    out({ type: 'result', is_error: true, result: "You've hit your 5-hour limit · resets 10:40pm (Asia/Bangkok)" });
+    process.exit(1);
+  }
+  out({ type: 'assistant', message: { content: [{ type: 'text', text: `ok:${jeton}` }] } });
+  out({ type: 'result', subtype: 'success', result: `ok:${jeton}`, usage: { input_tokens: 1, output_tokens: 1 } });
+  process.exit(0);
+};
+process.stdin.on('data', (d) => { if (String(d).includes('\n')) go(); });
+process.stdin.on('end', go);

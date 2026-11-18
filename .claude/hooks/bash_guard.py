@@ -49,7 +49,9 @@ if re.search(r"scripts/(deploy|check_prod_parity|check)[a-z_]*\.sh", cmd):
 # ── pkill ────────────────────────────────────────────────────────────────────
 # Un pkill par nom de process s'auto-tue, ou tue le Chrome de Playwright que
 # la session est en train de piloter.
-if re.search(r"\bpkill\b", cmd):
+# 2026-10-28 : en position de commande seulement (7 refus sur un texte cite),
+# et le motif a crochets passe : pkill -f '[h]ermes' ne se vise pas lui-meme.
+if re.search(r"(^|[;&|(`]\s*|\$\(\s*|\b(?:then|do|sudo)\s+)pkill\b(?![^;&|\n]*\[[A-Za-z0-9]\])", cmd, re.M):
     deny(
         "pkill interdit (s'auto-tue, ou tue le Chrome de "
         "Playwright). Viser un PID explicite : lsof -i:PORT puis kill <pid>, "
@@ -117,7 +119,10 @@ for _seg in re.split(r"&&|\|\||;|\n|\|", cmd):
         # une variable vide n'y élargit rien, et un garde-fou qui crie pour
         # rien apprend à être ignoré.
         _tete = re.match(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)", _a)
-        if _tete and _tete.group(1) not in ("HOME", "PWD", "TMPDIR", "CLAUDE_PROJECT_DIR"):
+        # 2026-10-28 : variable posee non vide dans la meme commande (V=/x/y) :
+        # elle ne peut pas etre vide, 37 faux refus sur 51.
+        _posee = _tete and re.search(r"(^|[\s;&(])" + _tete.group(1) + r"=[\"']?[/~.$\w][^\s;&]*", cmd)
+        if _tete and not _posee and _tete.group(1) not in ("HOME", "PWD", "TMPDIR", "CLAUDE_PROJECT_DIR"):
             if not re.match(r"^\$\{[A-Za-z_][A-Za-z0-9_]*:[?+-]", _a):
                 deny(
                     f"« {_seg[:60]} » commence son chemin par une variable non "
@@ -195,13 +200,16 @@ for _seg in re.split(r"&&|\|\||;|\n|\|", cmd):
 # Remede : editer l'unite, puis demander a VJ de la recharger, ou passer par
 # scripts/redemarrer-au-calme.sh qui attend la fin des tours.
 _SERVICES_VITAUX = ("claude-proxy", "hermes-gateway")
-if re.search(r"\bsystemctl\b", cmd) and re.search(
-    r"\b(restart|stop|kill|reload-or-restart|try-restart)\b", cmd
-):
+# 2026-10-28 : verbe ET service dans le meme appel systemctl (7 faux refus
+# quand le verbe et le nom du service etaient dans 2 commandes differentes).
+_SYSTEMCTL = re.findall(
+    r"systemctl\s+(?:--\S+\s+)*(?:restart|stop|kill|reload-or-restart|try-restart)\s+[^;&|\n]*", cmd)
+if _SYSTEMCTL and not re.search(r"\bVJ_AUTORISE_REDEM=1\b", cmd):  # ordre ecrit de VJ, 2026-11-01
+    cmd_sys = " ".join(_SYSTEMCTL)
     # Les instances distantes suffixées (claude-proxy-<nom>) n'hebergent
     # aucun sous-agent de cette machine : elles ne sont pas vitales ici.
     for _svc in _SERVICES_VITAUX:
-        if re.search(re.escape(_svc) + r"(?![-\w])", cmd):
+        if re.search(re.escape(_svc) + r"(?![-\w])", cmd_sys):
             deny(
                 f"« {_svc} » heberge les sous-agents en cours : le redemarrer "
                 "les tue tous, y compris celui qui lance la commande. "

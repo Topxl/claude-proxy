@@ -13,7 +13,9 @@ sleep 2
 post() {
   curl -s -m 15 http://127.0.0.1:8979/anthropic/v1/messages -H 'content-type: application/json' -d "{\"model\":\"opus-toolrelay\",\"max_tokens\":50,\"system\":\"prime sys\",\"tools\":[{\"name\":\"ipython\",\"description\":\"x\",\"input_schema\":{\"type\":\"object\"}}],\"messages\":$1}" > /dev/null
 }
-U1='{"role":"user","content":[{"type":"text","text":"premiere demande","cache_control":{"type":"ephemeral"}}]}'
+# Le 1er message porte les blocs qu'Hermes colle pour un seul appel puis retire
+# de l'historique (memoire, regles apprises) : la reprise doit les ignorer.
+U1='{"role":"user","content":[{"type":"text","text":"premiere demande\n\n<memory-context>\nfait #1\n</memory-context>\n\n<regles-apprises>\n- regle\n</regles-apprises>","cache_control":{"type":"ephemeral"}}]}'
 A='{"role":"assistant","content":[{"type":"text","text":"resume ok"}]}'
 post "[$U1]"
 post "[{\"role\":\"user\",\"content\":\"premiere demande\"},$A,{\"role\":\"user\",\"content\":\"deuxieme\"}]"
@@ -34,4 +36,4 @@ if src != {'prime'}: faux.append(f'sources {src}')
 print('ECHEC', faux) if faux else print('OK : neuve, reprise, reprise, neuve apres compactage ; source prime')
 sys.exit(1 if faux else 0)
 PY
-r=$?; grep "\[relais" "$T/log" | grep demarrage | sed 's/.*demarrage, //'; exit $r
+r=$?; grep "\[relais" "$T/log" | grep -E "demarrage|ratee" | sed "s/.*demarrage, //"; exit $r

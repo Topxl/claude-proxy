@@ -39,8 +39,7 @@
     "ask": [
       "Bash(git reset --hard*)",
       "Read(.env)",
-      "Edit(.env)",
-      "Write(.env)"
+      "Edit(.env)"
     ],
     "deny": [
       "Bash(git push --force*)",

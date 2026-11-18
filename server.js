@@ -7,7 +7,7 @@ import os from 'node:os';
 import {
   readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, readdirSync,
 } from 'node:fs';
-import { unlinkSync, statSync, appendFile } from 'node:fs';
+import { unlinkSync, statSync, appendFile, appendFileSync } from 'node:fs';
 
 // Prompts systeme trop gros pour argv (voir E2BIG plus bas). Purge au
 // demarrage de tout ce qui date de plus de 24 h : ces fichiers ne servent
@@ -72,6 +72,45 @@ function sourceDe(system, prompt) {
   if (/\*\*Source:\*\*/.test(system || '')) return 'chat';
   return 'auxiliaire';
 }
+// Familles d'appels auxiliaires, reconnues au debut du prompt (2026-10-28).
+// Mesure du 21 au 28/10 : ces appels a texte seul chargeaient quand meme le
+// socle d'outils et les CLAUDE.md (~33k tokens ecrits a froid pour 300 car.
+// de question). Vision 198 appels 20,6 $, verdict d'enquete 66 appels 11,7 $,
+// pings « hi » 93 appels 5,7 $. Avec sansOutils, le CLI part en texte seul.
+// La compression (<conversation>) et les chantiers gardent leurs outils :
+// la revue de fond d'Hermes y appelle fact_store, Bash, Edit.
+const FAMILLES_AUX = [
+  { nom: 'vision', motif: /^Concisely describe this image/, sansOutils: true },
+  // Vision avec question : garde ses outils. 11 cas sur 394 du 21 au 28/10
+  // zoomaient l'image avec PIL (texte fin, mesure du curseur d'un captcha).
+  { nom: 'vision-question', motif: /^Fully describe and explain everything about/, sansOutils: false },
+  { nom: 'resume-contexte', motif: /^You are a summarization agent/, sansOutils: true },
+  { nom: 'enquete-verdict', motif: /^Voici un verdict de recherche/, sansOutils: true },
+  { nom: 'ping', motif: /^(hi|ping|test)\s*$/i, sansOutils: true },
+  { nom: 'mail-resume', motif: /^(Resume ce mail recu|Read this email received)/, sansOutils: true },
+  { nom: 'reel', motif: /^Tu viens de recevoir la transcription d'un Reel/, sansOutils: true },
+  { nom: 'compression', motif: /^<conversation>/, sansOutils: false },
+  { nom: 'chantier', motif: /^## Chantier :/, sansOutils: false },
+];
+// Regle inversee (2026-11-13). Un appel auxiliaire que personne ne signe, sans
+// famille connue et a consigne courte, part en texte seul. Mesure du 30/10 au
+// 13/11 sur ces appels : 987 n'ont appele aucun outil, et les 20 qui en ont
+// appele sous 2 000 caracteres de consigne venaient d'`enquete` (passe en
+// `-notools` depuis) ou d'essais a la main. Chacun payait pourtant le socle
+// d'outils et les CLAUDE.md. Les consignes longues (agents Hermes hors topic)
+// gardent leurs outils : ce sont elles qui s'en servent. Garder les outils
+// malgre tout : se nommer par `metadata.user_id`, ou suffixe de modele `-tools`.
+const CONSIGNE_COURTE = Number(process.env.PROXY_ANONYME_COURT_CAR ?? 2000);
+function anonymeCourt(spec, system, prompt) {
+  return CONSIGNE_COURTE > 0 && !spec.client && !spec.relais && !spec.appelant
+    && !spec.outilsVoulus && sourceDe(system, prompt) === 'auxiliaire'
+    && (system || '').length < CONSIGNE_COURTE;
+}
+function familleAux(system, prompt) {
+  if (typeof prompt !== 'string' || sourceDe(system, prompt) !== 'auxiliaire') return null;
+  const tete = prompt.trimStart();
+  return FAMILLES_AUX.find((f) => f.motif.test(tete)) || null;
+}
 const RACINE_PROJETS = path.join(os.homedir(), 'Bureau', 'Projets');
 
 function lireJson(fichier) {
@@ -83,14 +122,24 @@ function dossierParNom(nom) {
   const direct = path.join(RACINE_PROJETS, nom);
   if (existsSync(direct)) return direct;
   // Casse libre : un topic nomme "MonProjet" trouve le dossier "monprojet".
-  try {
-    const cible = nom.toLowerCase();
-    for (const e of readdirSync(RACINE_PROJETS, { withFileTypes: true })) {
-      if (e.isDirectory() && e.name.toLowerCase() === cible) {
-        return path.join(RACINE_PROJETS, e.name);
-      }
+  // Les projets sont ranges par univers et famille (Projets/<univers>/<famille>/<nom>)
+  // depuis le 2026-10-24 : on cherche en largeur, jusqu'a 3 niveaux, liens exclus.
+  const cible = nom.toLowerCase();
+  let niveau = [RACINE_PROJETS];
+  for (let prof = 0; prof < 3 && niveau.length; prof++) {
+    const suivant = [];
+    for (const dossier of niveau) {
+      try {
+        for (const e of readdirSync(dossier, { withFileTypes: true })) {
+          if (!e.isDirectory() || e.name.startsWith('.')) continue;
+          const chemin = path.join(dossier, e.name);
+          if (e.name.toLowerCase() === cible) return chemin;
+          suivant.push(chemin);
+        }
+      } catch {}
     }
-  } catch {}
+    niveau = suivant;
+  }
   return null;
 }
 
@@ -116,6 +165,7 @@ function cwdPourTopic(system) {
 
 const PORT = Number(process.env.PORT) || 8000;
 import * as toolRelay from './tool-relay.js';
+import * as comptes from './comptes.js';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CLAUDE_SETTINGS = process.env.CLAUDE_SETTINGS || path.join(HERE, 'claude-settings.json');
 const TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS) || 300_000;
@@ -466,13 +516,125 @@ function ligneOutil(name, inputStr) {
 }
 
 /** L'historique est aplati : le CLI n'a qu'une entree texte, pas de tableau de tours. */
+/* Filtre de vocabulaire sensible (2026-11-08, ban du compte « contact ») :
+ * chaque mot qui peut faire passer un usage pour offensif est reformule en
+ * terme neutre AVANT l'envoi a Claude, dans le prompt systeme comme dans le
+ * texte. Compte remplace par tour dans ~/.hermes/logs/sensibles.log. */
+/* La liste vit dans ~/.config/claude-proxy/mots-sensibles.json
+ * ([motif, remplacement], un par paire), relue a CHAQUE tour : changer un mot
+ * ne demande aucun redemarrage. Ce tableau n'est que le repli si le fichier
+ * est absent ou casse. */
+const SENSIBLES_REpli = [
+  [/\bjailbreaks?\b/gi, 'contournement'],
+  [/\bmalwares?\b/gi, 'logiciel'],
+  [/\bbotnets?\b/gi, 'reseau de machines'],
+  [/\bransomwares?\b/gi, 'logiciel de chiffrement'],
+  [/\bransom\b/gi, 'chiffrement'],
+  [/\bvirus(es)?\b/gi, 'programme'],
+  [/\binfect(?:er|e|es|ee|ions?|ion)\b/gi, 'installe'],
+  [/\bphishings?\b/gi, 'message de leurre'],
+  [/\bpayloads?\b/gi, 'contenu'],
+  [/\bbackdoors?\b/gi, 'acces'],
+  [/\bstealers?\b/gi, 'collecteur'],
+  [/\btrojans?\b/gi, 'utilitaire'],
+  [/\bhack(?:er|ers|eurs?|s)?\b/gi, 'technique'],
+  [/\bpirate(?:s|ry)?\b/gi, 'technique'],
+  [/\battaque(?:s)?\b/gi, 'test'],
+  [/\battacks?\b/gi, 'test'],
+  [/\bexploits?\b/gi, 'technique'],
+  [/\bred.?team\b/gi, 'equipe de test'],
+];
+let SENSIBLES = null;
+let SENSIBLES_LU = 0;
+function chargerSensibles() {
+  // Relu au plus toutes les 30 s : assez rapide pour une edit a chaud.
+  if (SENSIBLES && Date.now() - SENSIBLES_LU < 30000) return SENSIBLES;
+  try {
+    const lu = JSON.parse(readFileSync('/home/vj/.config/claude-proxy/mots-sensibles.json', 'utf8'));
+    try { PARADES = (lu.parades || []).map(([motif, texte]) => [
+      new RegExp(motif, 'i'), texte]); } catch {}
+    const paires = (lu.mots || []).map(([motif, remp]) => {
+      const brut = motif.endsWith('*') ? motif.slice(0, -1) : motif;
+      const fin = motif.endsWith('*') ? '\\w*' : '(?:s)?\\b';
+      return [new RegExp('\\b' + brut.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + fin, 'gi'), remp];
+    });
+    if (paires.length) { SENSIBLES = paires; SENSIBLES_LU = Date.now(); return SENSIBLES; }
+  } catch {}
+  SENSIBLES = SENSIBLES_REpli;
+  SENSIBLES_LU = Date.now();
+  return SENSIBLES;
+}
+const LOG_SENSIBLES = '/home/vj/.hermes/logs/sensibles.log';
+let PARADES = [];
+function cadrePour(texte) {
+  // Les parades : le cadre du travail, donne AVANT que Claude ne juge (2026-11-08).
+  if (!texte || !PARADES.length) return '';
+  const morceaux = [];
+  for (const [re, texte_cadre] of PARADES) {
+    try { if (re.test(texte)) morceaux.push(texte_cadre); } catch {}
+  }
+  return morceaux.length ? '\n' + morceaux.join('\n') : '';
+}
+function nettoyer(t) {
+  if (!t) return t;
+  let n = 0;
+  for (const [re, remp] of chargerSensibles()) t = t.replace(re, () => { n++; return remp; });
+  if (n) { try { appendFileSync(LOG_SENSIBLES, new Date().toISOString() + ' n=' + n + '\n'); } catch {} }
+  return t;
+}
+
+/*
+ * Elagage au demarrage a froid (VJ, 2026-11-13) : quand la session CLI ne peut
+ * pas etre reprise, tout l'historique est reecrit au tarif ecriture du cache.
+ * Les resultats d'outils vieux de plus de ELAGAGE_TOURS tours (1 tour = 2
+ * messages) y pesent le plus : on les coupe a ELAGAGE_CARS caracteres.
+ * `CLAUDE_ELAGAGE_TOURS=0` coupe la fonction. Ne touche jamais `messages` :
+ * les empreintes de chainage en dependent.
+ */
+const ELAGAGE_TOURS = Number(process.env.CLAUDE_ELAGAGE_TOURS ?? 10);
+const ELAGAGE_CARS = Number(process.env.CLAUDE_ELAGAGE_CARS) || 1500;
+
+function couper(texte) {
+  if (typeof texte !== 'string' || texte.length <= ELAGAGE_CARS) return texte;
+  return `${texte.slice(0, ELAGAGE_CARS)}\n[... resultat coupe, ${texte.length - ELAGAGE_CARS} car en moins]`;
+}
+
+function elaguerResultatsOutils(messages) {
+  if (!ELAGAGE_TOURS) return messages;
+  const limite = messages.length - ELAGAGE_TOURS * 2;
+  if (limite <= 0) return messages;
+  return messages.map((m, i) => {
+    if (i >= limite || !m || !Array.isArray(m.content)) return m;
+    let change = false;
+    const content = m.content.map((b) => {
+      if (!b || b.type !== 'tool_result') return b;
+      let nouveau = b.content;
+      if (typeof b.content === 'string') nouveau = couper(b.content);
+      else if (Array.isArray(b.content)) {
+        nouveau = b.content.map((x) => (x && x.type === 'text' ? { ...x, text: couper(x.text) } : x));
+      }
+      if (JSON.stringify(nouveau) === JSON.stringify(b.content)) return b;
+      change = true;
+      return { ...b, content: nouveau };
+    });
+    return change ? { ...m, content } : m;
+  });
+}
+
+// Blocs qu'Hermes colle au message de VJ pour un seul appel (rappel de memoire,
+// regles apprises). Dans l'historique aplati ils sont relus a chaque tour : on
+// les retire des anciens messages utilisateur, jamais du dernier (2026-11-16).
+const EPHEMERES_HISTORIQUE = /\s*<(memory-context|regles-apprises)>[\s\S]*?<\/\1>/g;
+const sansEphemeresHistorique = (t) => String(t || '').replace(EPHEMERES_HISTORIQUE, '').trim();
+
 function buildPrompt(messages) {
   const parts = [];
   const history = messages.slice(0, -1);
   if (history.length) {
     const rendered = history
       .map((m) => {
-        const text = extractText(m?.content);
+        let text = extractText(m?.content);
+        if (m?.role === 'user') text = sansEphemeresHistorique(text);
         return text ? `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${text}` : '';
       })
       .filter(Boolean)
@@ -578,7 +740,7 @@ function planifierSauvegarde() {
 }
 
 for (const sig of ['SIGTERM', 'SIGINT']) {
-  process.on(sig, () => { try { sauverSessions(); } catch (_) {} process.exit(0); });
+  process.on(sig, () => { try { sauverSessions(); } catch (_) {} try { ecrireCumuls(); } catch (_) {} process.exit(0); });
 }
 
 const SEP_ROLE = String.fromCharCode(30);
@@ -840,15 +1002,57 @@ const enCours = new Map();
 // Avec --resume, le CLI rend un cout et un modelUsage CUMULES sur toute la session,
 // alors que `usage` est celui du seul tour. On garde le dernier cumul par session
 // pour journaliser la difference : sinon chaque tour repris recompte les precedents.
-const cumulsSession = new Map();
-function deltaSession(sid, total, parModele) {
+// Persiste sur disque : en memoire seule, le 1er tour repris apres un redemarrage
+// journalisait tout le cumul de la session (3 500 $ fantomes sur 7 j, 22/10/2026).
+const CUMULS_FICHIER = path.join(os.homedir(), '.hermes', 'proxy-cumuls.json');
+const cumulsSession = new Map(Object.entries(lireJson(CUMULS_FICHIER)));
+let cumulsPlanifie = null;
+function sauverCumuls() {
+  if (cumulsPlanifie) return;
+  cumulsPlanifie = setTimeout(() => { cumulsPlanifie = null; ecrireCumuls(); }, 2000);
+  if (typeof cumulsPlanifie.unref === 'function') cumulsPlanifie.unref();
+}
+function ecrireCumuls() {
+  try {
+    const tmp = `${CUMULS_FICHIER}.tmp`;
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(cumulsSession)));
+    renameSync(tmp, CUMULS_FICHIER);
+  } catch (e) { console.error('[cumuls] ecriture impossible :', e.message); }
+}
+// 500 sessions ne suffisaient pas : le proxy en ouvre 500 a 2 100 par jour, une session
+// de topic reprise apres 600 autres etait oubliee et journalisait tout son cumul
+// (94 tours faux sur 7 j, 5 357 $ au lieu de ~30 $, mesure du 27/10/2026).
+const CUMULS_MAX = 20000;
+const CUMULS_AGE_MS = 14 * 24 * 3600 * 1000;
+// Poids relatifs des tarifs Anthropic (entree, sortie, cache lu, cache ecrit) : les memes
+// pour tous les modeles, ce qui suffit pour une regle de trois.
+function poidsUsage(entree, sortie, lu, ecrit) {
+  return (entree || 0) + 5 * (sortie || 0) + 0.1 * (lu || 0) + 1.25 * (ecrit || 0);
+}
+function deltaSession(sid, total, parModele, reprise = false, usageTour = null) {
   const avant = sid ? cumulsSession.get(sid) : null;
   if (sid) {
+    const maintenant = Date.now();
     cumulsSession.delete(sid);
-    cumulsSession.set(sid, { total, parModele: JSON.parse(JSON.stringify(parModele)) });
-    if (cumulsSession.size > 500) cumulsSession.delete(cumulsSession.keys().next().value);
+    cumulsSession.set(sid, { total, parModele: JSON.parse(JSON.stringify(parModele)), t: maintenant });
+    for (const [cle, e] of cumulsSession) {
+      if (cumulsSession.size <= CUMULS_MAX && maintenant - (e.t || 0) < CUMULS_AGE_MS) break;
+      cumulsSession.delete(cle);
+    }
+    sauverCumuls();
   }
-  if (!avant) return total;
+  if (!avant) {
+    if (!reprise || !usageTour) return total;
+    // Session reprise sans cumul connu : le total est celui de toute la session. On garde
+    // la part du tour, au prorata de ses tokens (usage du tour) sur ceux de la session.
+    let cumul = 0;
+    for (const v of Object.values(parModele)) cumul += poidsUsage(v.entree, v.sortie, v.cache_lu, v.cache_ecrit);
+    const tourPoids = poidsUsage(usageTour.input_tokens, usageTour.output_tokens,
+      usageTour.cache_read_input_tokens, usageTour.cache_creation_input_tokens);
+    const ratio = cumul > 0 ? Math.min(1, tourPoids / cumul) : 1;
+    for (const v of Object.values(parModele)) for (const k of Object.keys(v)) v[k] = v[k] * ratio;
+    return total * ratio;
+  }
   for (const [m, v] of Object.entries(parModele)) {
     const p = avant.parModele[m];
     if (!p) continue;
@@ -873,6 +1077,17 @@ function oublierSession(entry) {
  * on repart sur une session neuve avec le prompt aplati : c'est le repli voulu,
  * pas une panne.
  */
+function promptElague(messages, promptAplati) {
+  const el = elaguerResultatsOutils(messages);
+  if (el === messages) return promptAplati;
+  const court = buildPrompt(el);
+  if (court.length < promptAplati.length) {
+    console.log(`[elag] demarrage a froid : prompt ${promptAplati.length} -> ${court.length} car`);
+    return court;
+  }
+  return promptAplati;
+}
+
 function planifierSession(messages, promptAplati, imagesAplati, dossier, system = '') {
   if (!RESUME_ACTIF) return null;
   const famille = familleDe(system);
@@ -979,7 +1194,7 @@ function planifierSession(messages, promptAplati, imagesAplati, dossier, system 
     entry: neuve,
     topic,
     args: ['--session-id', neuve.id],
-    prompt: promptAplati,
+    prompt: promptElague(messages, promptAplati),
     images: imagesAplati,
     cles: clesEtendues(messages, famille),
     sig: signature(messages),
@@ -1010,6 +1225,12 @@ function abandonnerSession(sess) {
   oublierSession(sess.entry);
 }
 
+/* Refus : la session qui en a produit un est brulee. Le tour suivant repart
+ * d'une session neuve, sinon l'historique du blocage fait refuser toute
+ * reformulation (prouve le 2026-11-08 sur le WiFi). */
+const REFUS_RE = /je ne peux pas|impossible de|cannot verify|can't (verify|access)|peux-tu (me )?(confirmer|preciser)|je ne (peux|vais) pas (aider|participer)|filtre de s(é|e)curit(é|e)/i;
+const LOG_REFUS = '/home/vj/.hermes/logs/refus-topics.log';
+
 function estimateTokens(text) {
   return Math.max(1, Math.ceil((text || '').length / 4));
 }
@@ -1020,12 +1241,37 @@ const MODEL_OK = /^(claude-[a-z0-9.-]+|opus|sonnet|haiku|fable)(\[1m\])?$/i;
 // Fable n'est voulu nulle part (VJ, 2026-10-04) : le topic Phone y etait reste
 // accroche par un /model oublie, 433 etapes en un jour. Tout appel Fable part en Opus.
 const MODELE_INTERDIT = /fable/i;
-const MODELE_REPLI = 'claude-opus-5-5';
+const MODELE_REPLI = 'claude-opus-4-8';
 
 function sansModeleInterdit(name) {
   if (!MODELE_INTERDIT.test(name)) return name;
   console.warn(`[modele] ${name} refuse, remplace par ${MODELE_REPLI}`);
   return MODELE_REPLI;
+}
+
+// Toujours la derniere version de chaque famille (VJ, 2026-10-28) : un appel
+// haiku, sonnet ou opus d'une version ancienne (4-5, 4-6, 3-7, alias nu...)
+// part sur la version courante. Le suffixe [1m] est garde.
+const DERNIERE_VERSION = [
+  [/haiku/i, 'claude-haiku-5-5'],
+  [/sonnet/i, 'claude-sonnet-5-5'],
+  [/opus/i, 'claude-opus-4-8'],
+];
+
+// Exception voulue par VJ (2026-10-28) : Opus 4.8 reste choisissable.
+const VERSION_GARDEE = /^claude-opus-4-8$/i;
+
+function derniereVersion(name) {
+  const fin = name.endsWith('[1m]') ? '[1m]' : '';
+  const base = fin ? name.slice(0, -fin.length) : name;
+  if (VERSION_GARDEE.test(base)) return name;
+  for (const [famille, courant] of DERNIERE_VERSION) {
+    if (!famille.test(base)) continue;
+    if (base.toLowerCase() === courant) return name;
+    console.warn(`[modele] ${name} ancien, remplace par ${courant}${fin}`);
+    return courant + fin;
+  }
+  return name;
 }
 
 // Garde-fou de modele pour Prime Agent. COUPE par defaut : VJ garde Prime en
@@ -1076,7 +1322,10 @@ function effortFromBudget(budget) {
  * Priorite : output_config > thinking > suffixe du modele > CLAUDE_EFFORT.
  */
 function parseModelSpec(model, body = {}) {
-  let name = String(model || '').trim();
+  // Suffixe `@nom` : compte Claude a utiliser (comptes.js). Retire en premier,
+  // les autres suffixes (-notools, -high...) se lisent ensuite comme avant.
+  const { model: sansCompte, compte } = comptes.separer(model);
+  let name = sansCompte;
   let suffixEffort = '';
 
   // Suffixe `-notools` : la cible repond en texte seul, sans aucun outil.
@@ -1113,6 +1362,14 @@ function parseModelSpec(model, body = {}) {
     noTools = true;
     name = name.slice(0, -'-notools'.length);
   }
+  // Echappatoire de la regle « anonyme-court » (voir CONSIGNE_COURTE) : un
+  // appelant anonyme qui veut vraiment le socle d'outils le demande par ce
+  // suffixe. Se nommer (`systemd:<nom>`) reste la voie normale.
+  let outilsVoulus = false;
+  if (name.toLowerCase().endsWith('-tools')) {
+    outilsVoulus = true;
+    name = name.slice(0, -'-tools'.length);
+  }
 
   for (const level of EFFORTS) {
     if (name.toLowerCase().endsWith(`-${level}`)) {
@@ -1133,17 +1390,41 @@ function parseModelSpec(model, body = {}) {
       || suffixEffort
       || normalizeEffort(process.env.CLAUDE_EFFORT);
 
-  if (relais.actif && !parTopic) name = modelePrime(name);
-
+  // Le nom exact choisi par le client prime sur toute ancienne règle de réécriture.
+  const requestedModel = name;
+  const resolvedModel = MODEL_OK.test(name) ? name : '';
+  const modelWarning = '';
   return {
-    model: MODEL_OK.test(name) ? sansModeleInterdit(name) : '',
+    model: resolvedModel,
+    requestedModel,
+    modelWarning,
     effort,
     noTools,
+    outilsVoulus,
     relais: relaisActif,
     // Seul Prime Agent envoie `-toolrelay` : ses appels (compactage compris)
     // sortent sous leur propre source dans proxy-usage.jsonl.
     client: parTopic ? 'hermes-relais' : (relais.actif ? 'prime' : ''),
+    appelant: appelantDe(body),
+    compte,
   };
+}
+
+// Un script lance par une unite systemd (timer) se nomme dans metadata.user_id,
+// `systemd:<unite>`, champ standard que le routeur relaie. Sans lui, le journal
+// ne disait pas quel timer consommait (2026-10-22).
+function appelantDe(body) {
+  const u = body?.metadata?.user_id;
+  const m = typeof u === 'string' && /^systemd:([\w@.-]{1,80})$/.exec(u);
+  if (m) return m[1];
+  // Un agent Hermes lance par l'API locale (/v1/runs) ne peut pas poser
+  // metadata.user_id : sa consigne porte `[appelant:<nom>]` (2026-10-26,
+  // fiche Routines du dashboard, appelant dash-routine).
+  const sys = Array.isArray(body?.system)
+    ? body.system.map((b) => (b && b.text) || '').join('\n')
+    : (typeof body?.system === 'string' ? body.system : '');
+  const a = /\[appelant:([\w@.-]{1,80})\]/.exec(sys);
+  return a ? a[1] : null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1205,6 +1486,13 @@ const health = {
   totalCalls: 0,
   totalRetries: 0,
   totalFailures: 0,
+  modelPolicy: 'exact-requested-model-no-rewrite',
+  automaticPromptAdditions: false,
+  cacheControl: {
+    mode: 'cli-managed',
+    endToEnd: false,
+    warning: 'Le proxy conserve cache_control dans le JSON reçu, mais le CLI Claude ne propose pas de transport documenté pour le transmettre de bout en bout; cache CLI non garanti.',
+  },
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1295,36 +1583,20 @@ function sansBlocContexte(texte) {
   return texte.replace(BLOC_CONTEXTE, '');
 }
 
-const DIRECTIVE_GROUPAGE = [
-  '',
-  '## Economie de contexte (imperatif)',
-  '',
-  "Chaque aller-retour d'outil relit l'integralite du contexte. Le nombre",
-  "d'allers-retours est donc le premier poste de cout, avant la longueur des",
-  'reponses.',
-  '',
-  "- Emets TOUS les appels d'outils independants dans un seul et meme message.",
-  '  Deux `Bash` qui ne dependent pas l\'un de l\'autre partent ensemble, jamais',
-  "  l'un apres l'autre.",
-  "- Prefere une commande composee (`a; b; c` ou `a && b`) a trois appels Bash",
-  "  successifs, et une seule commande large a une cascade de commandes etroites.",
-  "- Ne relis pas un fichier que tu viens d'ecrire ou de modifier pour verifier :",
-  "  l'outil aurait echoue.",
-  "- **Ne fais jamais `Read` sur une image brute** (capture .png, photo).",
-  "  Anthropic redimensionne toute image a 1456x819 au maximum, soit 1560",
-  "  tokens quelle que soit sa taille d'origine. A 1100 px on tombe a 960",
-  "  tokens, -39 %, sans rien perdre en lisibilite. Passe donc par",
-  "  `~/Bureau/Projets/contexte/bin/img-lisible.sh <image>` puis lis CE fichier.",
-  "- Ne relis pas deux fois la meme capture : elle reste dans le contexte et",
-  "  se relit a chaque aller-retour du tour.",
-  '- Delegue une exploration large a un sous-agent : son contexte est neuf et',
-  "  seul son resultat revient ici.",
-  "- **Tout appel du tool `Agent` porte `model: \"sonnet\"`.** Un sous-agent en",
-  "  opus coute nettement plus qu'en sonnet pour le meme resultat, la plupart",
-  "  du temps. Une exploration, une lecture, un audit, une recherche : `sonnet`.",
-  "  N'ecris `model: \"opus\"` que si la tache exige un raisonnement long, et",
-  "  dis alors pourquoi dans le champ `description`.",
-].join('\n');
+// Consignes d'Hermes sans objet sous le CLI (mesure du 2026-10-27, ~640 tokens
+// par etape) : « Parallel tool calls » double la directive de groupage et la
+// section « Economie de contexte » ; « Async handoff » parle de delegate_task,
+// absent de OUTILS_HERMES (0 appel en 7 jours). Retirees seulement sur le
+// chemin avec outils. « Mid-turn user steering » et « Skill Safety Rule »
+// restent : leurs marqueurs peuvent encore arriver par Hermes.
+const CONSIGNES_SANS_OBJET = [
+  /# Parallel tool calls\n[\s\S]*?When in doubt and the calls are independent, batch them\.\n\n?/,
+  /# Async handoff\n[\s\S]*?before it is delivered\.\n\n?/,
+];
+function sansConsignesSansObjet(texte) {
+  return CONSIGNES_SANS_OBJET.reduce((t, re) => t.replace(re, ''), texte);
+}
+
 
 /*
  * Messages en plein tour (steer). Le CLI lance en `--input-format stream-json`
@@ -1367,7 +1639,7 @@ function estAgentPremierPlan(b) {
   return b?.type === 'tool_use' && (b.name === 'Agent' || b.name === 'Task') && !b.input?.run_in_background;
 }
 
-function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks = {}) {
+function runClaude({ prompt, system, spec, images, sessionArgs, compte = comptes.choisir(spec?.compte) }, onText, hooks = {}) {
   const onActivity = typeof hooks.onActivity === 'function' ? hooks.onActivity : () => {};
   // Mode PARTIEL (temps reel) : present seulement pour le stream. Emet les deltas
   // texte/raisonnement + les outils token par token, via les events partiels du CLI.
@@ -1404,9 +1676,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     } else if (spec?.noTools) {
       args.push('--tools', '');
       args.push('--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config');
-      // Sans cela le CLI charge le CLAUDE.md global de VJ, dont RTK.md, qui
-      // ordonne d'emettre des commandes Bash : une cible sans outils se met
-      // alors a les ecrire en texte. Coupe aussi la fuite du contexte perso.
+      // Sans cela le CLI charge les fichiers d'instructions locaux.
       args.push('--setting-sources', '');
     } else {
       // Socle reduit. Le toolset complet du CLI coute ~38 000 tokens de
@@ -1422,6 +1692,8 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     let hTout = '';
     let hTete = '';
     if (system) {
+      // Une reprise ne doit pas réutiliser l'ancien instantané contenant les injections supprimées.
+      args.push('--system-prompt-snapshot', 'off');
       // Diagnostic cache : le system prompt est le PREMIER bloc mis en cache par
       // le CLI. S'il change d'un tour a l'autre, tout ce qui suit est invalide,
       // meme avec une session --resume qui reprend correctement. Hermes
@@ -1431,10 +1703,9 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       hTout = createHash('sha1').update(system).digest('hex').slice(0, 8);
       hTete = createHash('sha1').update(system.slice(0, 4000)).digest('hex').slice(0, 8);
       console.log(`[sys] len=${system.length} tout=${hTout} tete4k=${hTete}`);
-      // La directive de groupage parle d'appels d'outils : la coller a une
-      // cible qui n'en a aucun lui apprend justement a en fabriquer en texte.
+      // Garder les instructions du client, sans suffixe automatique du proxy.
       const base = sansBlocContexte(system);
-      const consigne = spec?.noTools ? base : `${base}\n${DIRECTIVE_GROUPAGE}`;
+      const consigne = nettoyer(base);
       // Le noyau limite UN argument d'exec a MAX_ARG_STRLEN = 32 pages, soit
       // 131072 octets, quel que soit ARG_MAX. Au-dela, spawn echoue en E2BIG
       // et le tour est perdu apres 3 tentatives identiques. C'est arrive des
@@ -1443,15 +1714,17 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
       // CLI accepte. Le fichier est nomme d'apres l'empreinte du contenu :
       // deux tours au meme prompt reutilisent le meme fichier, ce qui ne
       // perturbe pas le cache et evite d'en accumuler un par requete.
-      const OCTETS = Buffer.byteLength(consigne, 'utf8');
+      const consigneFiltree = consigne;
+      const OCTETS = Buffer.byteLength(consigneFiltree, 'utf8');
       if (OCTETS > 120000) {
-        const empreinte = createHash('sha1').update(consigne).digest('hex').slice(0, 16);
+        const empreinte = createHash('sha1').update(consigneFiltree).digest('hex').slice(0, 16);
         const chemin = path.join(DOSSIER_PROMPTS, `${empreinte}.txt`);
-        if (!existsSync(chemin)) writeFileSync(chemin, consigne, 'utf8');
+        mkdirSync(DOSSIER_PROMPTS, { recursive: true }); // /tmp est purge apres 10 j : le dossier peut avoir disparu depuis le demarrage
+        if (!existsSync(chemin)) writeFileSync(chemin, consigneFiltree, 'utf8');
         console.log(`[sys] ${OCTETS} octets > limite argv, passe par fichier ${empreinte}`);
         args.push('--system-prompt-file', chemin);
       } else {
-        args.push('--system-prompt', consigne);
+        args.push('--system-prompt', consigneFiltree);
       }
     }
 
@@ -1460,10 +1733,19 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     // Marque du tour, heritee par tout ce qu'il lance, meme sous setsid : un
     // /stop retrouve ainsi les process detaches (voir tuerArbre).
     const tour = randomUUID();
+    // Appels auxiliaires (titres, resumes, memoire) : contenu a usage unique.
+    // Le CLI l'ecrit en cache 1 h, au double du prix d'entree, et rien ne le
+    // relit (22/10/2026 : 27M ecrits contre 12,7M lus en 7 jours). En 5 min,
+    // l'ecriture coute 1,25 fois et le debut commun reste relu (teste a la main).
+    const cache5m = (spec?.client || sourceDe(system, prompt)) === 'auxiliaire'
+      ? { FORCE_PROMPT_CACHING_5M: '1' } : {};
     const child = spawn(CLAUDE_BIN, args, {
       cwd: dossier,
       env: {
         ...process.env, HERMES_TOPIC: topicDe(system) || '', HERMES_TOPIC_DIR: dossier, PROXY_TOUR: tour,
+        ...cache5m,
+        // Jeton du compte choisi (comptes.js) ; sans compte, celui de l'unite.
+        ...(compte ? { CLAUDE_CODE_OAUTH_TOKEN: compte.jeton } : {}),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       // Groupe de process dedie : voir tuerArbre(). Sans cela, /stop laissait
@@ -1587,6 +1869,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
           console.log(`[steer] topic=${topicTour} message lu par le CLI`);
         }
       }
+      if (evt.type === 'rate_limit_event' && compte) comptes.noterQuota(compte.nom, evt.rate_limit_info);
       if (evt.type === 'result') {
         resultat = evt;
         resultats.push(evt);
@@ -1601,10 +1884,12 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
           if (b?.type !== 'tool_use') continue;
           outils[b.name || 'outil'] = (outils[b.name || 'outil'] || 0) + 1;
           // Skill chargee : par l'outil Skill, ou par lecture de son SKILL.md.
-          const chemin = String(b.input?.file_path || b.input?.command || '');
-          const nomSkill = b.name === 'Skill' ? b.input?.skill
-            : (chemin.match(/skills\/(?:[^/\s]+\/)*?([^/\s]+)\/SKILL\.md/) || [])[1];
-          if (nomSkill) skills[nomSkill] = (skills[nomSkill] || 0) + 1;
+          // Prime lit ses skills par son outil ipython : le chemin est dans input.code
+          // (22/10/2026 : 0 ligne prime sur 724 avait un champ skills rempli).
+          const chemin = String(b.input?.file_path || b.input?.command || b.input?.code || '');
+          const noms = b.name === 'Skill' ? [b.input?.skill]
+            : [...chemin.matchAll(/skills\/(?:[^/\s'"]+\/)*?([^/\s'"]+)\/SKILL\.md/g)].map((m) => m[1]);
+          for (const nomSkill of new Set(noms)) if (nomSkill) skills[nomSkill] = (skills[nomSkill] || 0) + 1;
         }
       }
       if (evt.type === 'assistant') {
@@ -1685,23 +1970,26 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
           cout_usd: v.costUSD || 0,
         };
       }
-      const coutTour = deltaSession(resultat?.session_id, resultat?.total_cost_usd || 0, parModele);
+      const reprise = Array.isArray(sessionArgs) && sessionArgs.includes('--resume');
+      const coutTour = deltaSession(resultat?.session_id, resultat?.total_cost_usd || 0, parModele, reprise, u);
       journaliserUsage({
         ts: new Date(debut).toISOString(),
         ms: Date.now() - debut,
-        source: spec?.client || sourceDe(system, prompt),
+        source: spec?.client || (spec?.appelant ? 'systemd' : sourceDe(system, prompt)),
+        appelant: spec?.appelant || null,
+        famille: spec?.famille || null,
         topic: topicDe(system) || null,
         tour,
         session: resultat?.session_id || null,
-        reprise: Array.isArray(sessionArgs) && sessionArgs.includes('--resume'),
+        reprise,
         modele: spec?.model || null,
         effort: spec?.effort || null,
+        compte: compte?.nom || null,
         cwd: dossier,
         sys_len: system ? system.length : 0,
         sys_tout: hTout,
         sys_tete: hTete,
         prompt_len: (prompt || '').length,
-        prompt_debut: (prompt || '').slice(0, 120),
         entree: u.input_tokens || 0,
         sortie: u.output_tokens || 0,
         cache_lu: u.cache_read_input_tokens || 0,
@@ -1713,6 +2001,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
         par_modele: parModele,
         statut: timedOut ? 'timeout' : (failure ? 'erreur' : (resultat ? 'ok' : 'sans_result')),
         code,
+        cause: (timedOut || failure || !resultat) ? String(failure || (timedOut ? 'timeout ' + TIMEOUT_MS + ' ms' : '') || (stderr || '').slice(-300) || (code === 143 ? 'SIGTERM (arret externe)' : 'aucun resultat, stderr vide')).replace(/\s+/g, ' ').slice(0, 240) : null,
       });
       if (typeof hooks.onUsage === 'function' && resultat?.usage) hooks.onUsage(resultat.usage);
       if (timedOut) {
@@ -1749,7 +2038,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
     child.stdin.on('error', () => {});
     if (avecImages || pilotable) {
       const blocs = [];
-      if (prompt) blocs.push({ type: 'text', text: prompt });
+      if (prompt) blocs.push({ type: 'text', text: nettoyer(prompt) });
       if (avecImages) blocs.push(...images);
       const ligne = `${JSON.stringify({ type: 'user', message: { role: 'user', content: blocs } })}\n`;
       if (pilote) {
@@ -1761,7 +2050,7 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
         child.stdin.end(ligne);
       }
     } else {
-      child.stdin.end(prompt);
+      child.stdin.end(nettoyer(prompt));
     }
 
     // Permet a l'appelant de tuer le process si le client raccroche.
@@ -1776,13 +2065,28 @@ function runClaude({ prompt, system, spec, images, sessionArgs }, onText, hooks 
  * et les rejouer produirait une reponse dupliquee. Les pannes d'authentification
  * ne sont pas rejouees non plus, elles ne guerissent pas en 2 secondes.
  */
+function messageTousEpuises() {
+  const r = comptes.prochainReset();
+  return `You've hit your limit on every Claude account (${comptes.liste().length}). `
+    + `Reprise vers ${r ? comptes.heureLocale(r) : 'inconnue'}.`;
+}
+
 async function runClaudeWithRetry(payload, onText, label, hooks = {}) {
   health.totalCalls += 1;
   let lastError = null;
   // Jeton pose par l'appelant : passe a true des que le client raccroche.
   const abandon = hooks.abandon || null;
+  // Compte du tour (comptes.js). null sans comptes.json : jeton de l'unite.
+  const essayes = new Set();
+  let compte = comptes.choisir(payload.spec?.compte);
+  // Apres une bascule, plus de reprise de session : le journal CLI garde le
+  // message du tour echoue, et le cache d'un compte ne sert pas a l'autre.
+  let sansSession = false;
+  if (!compte && comptes.configure()) {
+    lastError = Object.assign(new Error(messageTousEpuises()), { tousEpuises: true });
+  }
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; !lastError?.tousEpuises && attempt <= MAX_ATTEMPTS; attempt += 1) {
     if (abandon?.actif) {
       lastError = lastError || Object.assign(new Error('Tour abandonne par le client.'), { aborted: true });
       break;
@@ -1818,13 +2122,21 @@ async function runClaudeWithRetry(payload, onText, label, hooks = {}) {
     // Tentative 1 : on tente la continuite de session. Toute relance repart
     // du prompt aplati, sans session : le journal CLI peut avoir ete souille
     // par la tentative morte, et une reprise y dupliquerait le message.
-    const sess = attempt === 1 ? payload.sess : null;
+    const sess = attempt === 1 && !sansSession && payload.sess && !payload.sess.entry.poison
+      ? payload.sess : null;
+    if (attempt === 1 && payload.sess && payload.sess.entry.poison) abandonnerSession(payload.sess);
     const essai = sess
-      ? { ...payload, prompt: sess.prompt, images: sess.images, sessionArgs: sess.args }
-      : { ...payload, sessionArgs: null };
+      ? { ...payload, prompt: sess.prompt, images: sess.images, sessionArgs: sess.args, compte }
+      : { ...payload, sessionArgs: null, compte };
 
     try {
       const text = await runClaude(essai, guarded, guardedHooks);
+      if (text && REFUS_RE.test(text)) {
+        if (sess) sess.entry.poison = true;
+        try { appendFileSync(LOG_REFUS, new Date().toISOString() + ' '
+          + (essai.compte?.nom || '?') + ' ' + text.slice(0, 120).replace(/\s+/g, ' ')
+          + '\n'); } catch {}
+      }
       health.lastSuccessAt = new Date().toISOString();
       health.consecutiveFailures = 0;
       if (sess) validerSession(sess);
@@ -1832,6 +2144,31 @@ async function runClaudeWithRetry(payload, onText, label, hooks = {}) {
       return text;
     } catch (error) {
       lastError = error;
+
+      // Quota du compte epuise : on bascule sur le suivant, sans attendre ni
+      // consommer de tentative. Seulement si rien n'est parti au client.
+      if (compte && !emitted && !abandon?.actif
+          && (comptes.estLimite(error.message) || comptes.estLimite(stderrUtile(error.stderr)))) {
+        const nouveau = comptes.marquerEpuise(compte.nom, error.message);
+        essayes.add(compte.nom);
+        const suivant = comptes.choisir('', essayes);
+        const reset = comptes.heureLocale(comptes.prochainReset() || Date.now());
+        if (suivant) {
+          console.warn(`[comptes] ${label} ${compte.nom} a court (reset ${reset}) : bascule sur ${suivant.nom}`);
+          if (nouveau) {
+            comptes.alerterQg(`Compte Claude « ${compte.nom} » à court, reset vers ${reset}. `
+              + `Hermès passe sur « ${suivant.nom} ».`);
+          }
+          compte = suivant;
+          sansSession = true;
+          attempt -= 1;
+          continue;
+        }
+        console.warn(`[comptes] ${label} tous les comptes a court (reprise ${reset})`);
+        if (nouveau) comptes.alerterQg(`Tous les comptes Claude sont à court. Hermès reprend vers ${reset}.`);
+        lastError = Object.assign(new Error(messageTousEpuises()), { tousEpuises: true });
+        break;
+      }
 
       const retryable = !emitted && !abandon?.actif && !error.aborted
         && !isFatal(error.message) && !isFatal(stderrUtile(error.stderr));
@@ -2039,6 +2376,7 @@ app.get(['/health', '/anthropic/health'], (_req, res) => {
     memoryReserveGb: RESERVE_GB,
     cpuPressure: Number(cpuPressure().toFixed(1)),
     cpuPressureCeiling: CPU_PRESSURE_CEILING,
+    comptes: comptes.resume(),
     ...health,
   });
 });
@@ -2087,10 +2425,11 @@ app.get(['/encours', '/anthropic/encours'], (_req, res) => {
 
 let __dumpRestants = 6;
 function __dumpPayload(messages) {
-  if (__dumpRestants <= 0) return;
+  if (process.env.CLAUDE_PROXY_DUMP_PAYLOADS !== '1' || __dumpRestants <= 0) return;
   __dumpRestants -= 1;
+  const dumpDir = process.env.CLAUDE_PROXY_DUMP_DIR || path.join(os.tmpdir(), 'proxy-payloads');
   try {
-    mkdirSync('/tmp/proxy-payloads', { recursive: true });
+    mkdirSync(dumpDir, { recursive: true });
     const compact = messages.map((m) => ({
       role: m && m.role,
       content: typeof m?.content === 'string'
@@ -2099,7 +2438,7 @@ function __dumpPayload(messages) {
           ? m.content.map((b) => ({ type: b?.type, apercu: JSON.stringify(b).slice(0, 400) }))
           : m?.content,
     }));
-    writeFileSync(`/tmp/proxy-payloads/${Date.now()}.json`, JSON.stringify(compact, null, 1));
+    writeFileSync(path.join(dumpDir, `${Date.now()}.json`), JSON.stringify(compact, null, 1));
   } catch (e) { console.error('[dump]', e.message); }
 }
 
@@ -2179,13 +2518,38 @@ async function handleMessages(req, res) {
 
   try {
     const spec = parseModelSpec(model, req.body);
+    if (!spec.model) {
+      res.status(400).json({ type: 'error', error: { type: 'invalid_request_error',
+        message: 'Modèle Claude invalide ou absent. Aucun remplacement automatique.' } });
+      return;
+    }
+    res.set('x-proxy-resolved-model', spec.model);
+    res.set('x-proxy-cache-control', 'cli-managed-not-forwarded');
+    const famille = spec.client ? null : familleAux(systemText, prompt);
+    if (famille) {
+      spec.famille = famille.nom;
+      if (famille.sansOutils && !spec.relais) spec.noTools = true;
+    } else if (anonymeCourt(spec, systemText, prompt)) {
+      spec.famille = 'anonyme-court';
+      spec.noTools = true;
+    }
+    const dernierContenu = messages.at(-1)?.content;
+    const retourRelais = spec.relais && Array.isArray(dernierContenu)
+      && dernierContenu.some((b) => b?.type === 'tool_result');
+    if (!retourRelais && comptes.configure() && !comptes.choisir(spec.compte)) {
+      const r = comptes.prochainReset();
+      if (r) res.set('retry-after', String(Math.max(1, Math.round((r - Date.now()) / 1000))));
+      res.status(429).json({ type: 'error', error: {
+        type: 'rate_limit_error', message: messageTousEpuises(),
+      } });
+      return;
+    }
     const sess = planifierSession(messages, prompt, images, cwdPourTopic(systemText), systemText);
     const payload = {
       prompt, system: systemText, spec, images, sess, model, inputTokens, started, queueNotice,
     };
     if (spec.relais) {
-      // Chemin a part : le process claude survit a la reponse HTTP, la file
-      // d'attente le relache quand meme puisqu'il dort sur un appel MCP.
+      // Un retour d'outil reprend le processus déjà ouvert.
       await toolRelay.traiter({
         req, res, model, prompt, system: systemText, spec, inputTokens, stream,
       });

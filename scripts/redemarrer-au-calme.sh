@@ -28,6 +28,13 @@ PAS_S="${PAS_S:-10}"
 
 horodate() { date '+%Y-%m-%d %H:%M:%S'; }
 
+# Chaque issue (relance faite, relance ratee, abandon) se dit au QG : VJ ne
+# doit pas avoir a demander si le proxy a ete relance (demande du 2026-10-27).
+au_qg() {
+  command -v qg-attente >/dev/null || return 0
+  qg-attente add "$1" --resume "$2" --source redemarrer-au-calme >/dev/null 2>&1 || true
+}
+
 tours_ouverts() {
   curl -s --max-time 5 "$SANTE" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("running",0))' 2>/dev/null \
@@ -53,6 +60,7 @@ while :; do
   ecoule=$(( $(date +%s) - debut ))
   if [ "$ecoule" -ge "$ATTENTE_MAX_S" ]; then
     echo "$(horodate) ABANDON : encore ${r} tour(s) et ${e} sous-agent(s) apres ${ecoule} s"
+    au_qg "Proxy NON relance" "Abandon apres ${ecoule} s : encore ${r} tour(s) et ${e} sous-agent(s) en cours. Les changements du proxy restent inactifs."
     exit 1
   fi
   echo "$(horodate) occupe : ${r} tour(s), ${e} sous-agent(s), ${ecoule} s ecoulees"
@@ -64,3 +72,8 @@ systemctl --user restart "$SERVICE"
 sleep 4
 etat=$(curl -s --max-time 5 "$SANTE")
 echo "$(horodate) sante apres relance : ${etat:-injoignable}"
+if printf '%s' "$etat" | grep -q '"status":"ok"'; then
+  au_qg "Proxy relance" "Relance faite a $(date '+%H:%M'), sans couper aucun tour. Sante : ok."
+else
+  au_qg "Proxy relance mais injoignable" "Relance a $(date '+%H:%M'), mais la sante ne repond pas : ${etat:-injoignable}. A regarder."
+fi

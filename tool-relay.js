@@ -23,6 +23,9 @@
  */
 
 import crypto from 'crypto';
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const SUFFIXE = '-toolrelay';
 // Fenetre de regroupement : le modele peut appeler plusieurs outils d'un coup.
@@ -55,14 +58,58 @@ const REPRISE_ACTIVE = process.env.RELAIS_REPRISE !== '0';
 const REPRISE_TTL_MS = 6 * 60 * 60 * 1000;
 const REPRISE_TOURS_MAX = 100;
 const reprises = new Map();     // empreinte des messages -> { id, sys, tours, ts }
+const REPRISES_FICHIER = process.env.CLAUDE_RELAY_SESSIONS_FICHIER
+  || path.join(os.homedir(), '.hermes', 'claude-proxy-relay-sessions.json');
 
-/** Forme stable d'un message : sans cache_control ni blocs de raisonnement. */
+function chargerReprises() {
+  if (!REPRISE_ACTIVE) return;
+  try {
+    const entries = JSON.parse(readFileSync(REPRISES_FICHIER, 'utf8'));
+    if (!Array.isArray(entries)) return;
+    for (const [cle, r] of entries) {
+      if (typeof cle !== 'string' || !r || typeof r.id !== 'string'
+          || typeof r.sys !== 'string' || !(r.ts > Date.now() - REPRISE_TTL_MS)) continue;
+      reprises.set(cle, { ...r, h: r.h || [], f: r.f || [], sysTexte: '' });
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn('[relais] registre de reprise illisible');
+  }
+}
+
+function sauverReprises() {
+  if (!REPRISE_ACTIVE) return;
+  try {
+    purgerReprises();
+    // Identifiants et empreintes seulement : aucun texte système ni message.
+    const entries = [...reprises].map(([cle, r]) => [cle,
+      { id: r.id, sys: r.sys, tours: r.tours, ts: r.ts, h: r.h, f: r.f }]);
+    mkdirSync(path.dirname(REPRISES_FICHIER), { recursive: true, mode: 0o700 });
+    const tmp = `${REPRISES_FICHIER}.tmp`;
+    writeFileSync(tmp, JSON.stringify(entries), { mode: 0o600 });
+    renameSync(tmp, REPRISES_FICHIER);
+  } catch (e) { console.warn('[relais] registre de reprise non écrit:', e.code); }
+}
+
+chargerReprises();
+
+/**
+ * Blocs qu'Hermes colle au message de VJ pour un seul appel, puis retire de
+ * l'historique au tour suivant (2026-10-15) : le rappel de memoire et les
+ * regles apprises. Sans les ignorer, le message qui ouvre chaque tour differait
+ * d'un appel a l'autre (2789 car stockes contre 652 renvoyes) et 20 reprises
+ * sur 20 ont rate dans le topic du goal Amazon, ~200k tokens reecrits par appel.
+ */
+const EPHEMERES = /\s*<(memory-context|regles-apprises)>[\s\S]*?<\/\1>/g;
+const sansEphemeres = (texte) => String(texte || '').replace(EPHEMERES, '').trimEnd();
+
+/** Forme stable d'un message : sans cache_control, raisonnement ni blocs ephemeres. */
 function canonique(m) {
   const c = m && m.content;
   const blocs = typeof c === 'string' ? [{ type: 'text', text: c }] : (Array.isArray(c) ? c : []);
+  const user = m && m.role === 'user';
   return [m && m.role, blocs.map((b) => {
     if (!b || b.type === 'thinking' || b.type === 'redacted_thinking') return null;
-    if (b.type === 'text') return ['t', b.text];
+    if (b.type === 'text') return ['t', user ? sansEphemeres(b.text) : b.text];
     if (b.type === 'tool_use') return ['u', b.id, b.name, b.input];
     if (b.type === 'tool_result') return ['r', b.tool_use_id, deps.extractText(b.content)];
     if (b.type === 'image') return ['i', String(b.source?.data || b.source?.url || '').length];
@@ -84,19 +131,103 @@ function purgerReprises() {
   while (reprises.size > 200) reprises.delete(reprises.keys().next().value);
 }
 
-/** La requete prolonge-t-elle un tour termine ? Rend { id, tours, texte } ou null. */
+/** Empreinte courte d'un seul message (diagnostic des reprises ratees). */
+function empreinteMsg(m) {
+  return crypto.createHash('sha1').update(JSON.stringify(canonique(m))).digest('hex').slice(0, 12);
+}
+
+/** Forme lisible d'un message, sans son contenu : role, puis type:taille par bloc. */
+function forme(m) {
+  return `${m && m.role}[${canonique(m)[1].map((b) => `${b[0]}${b[0] === 't' ? (b[1] || '').length
+    : b[0] === 'r' ? `${(b[2] || '').length}` : ''}`).join(',')}]`;
+}
+
+/** Ce qui retient un tour termine, pour une reprise et pour expliquer une ratee. */
+function entreeReprise(session, messages, system) {
+  return { id: session.cliId, sys: session.sys, tours: session.tours, ts: Date.now(),
+    h: messages.map(empreinteMsg), f: messages.map(forme), sysTexte: String(system || '') };
+}
+
+/**
+ * Pourquoi aucune reprise : une ligne de journal par ratee (2026-10-15).
+ * La nuit du goal Amazon (10/14 au 10/15), 77 tours du topic 23422 sont tous
+ * partis en session neuve sans dire pourquoi. On cherche l'entree qui partage
+ * le plus long debut avec la requete et on dit ou les deux divergent.
+ */
+function journaliserRatee(messages, system, raison) {
+  if (!REPRISE_ACTIVE) return;
+  const n = messages.length;
+  let detail = `${n} messages, fin ${messages.slice(-3).map(forme).join(' ')}`;
+  if (raison === 'absente' || raison === 'sys') {
+    const req = messages.slice(0, -2).map(empreinteMsg);
+    let meilleur = null; let k = -1;
+    for (const r of reprises.values()) {
+      if (!r.h) continue;
+      let i = 0;
+      while (i < r.h.length && i < req.length && r.h[i] === req[i]) i += 1;
+      if (i > k) { k = i; meilleur = r; }
+    }
+    if (meilleur) {
+      detail += ` · ${reprises.size} entrees, meilleure : ${k} messages communs sur ${meilleur.h.length} stockes`
+        + ` (requete ${req.length} avant le tour), session ${meilleur.id}`;
+      if (k < Math.max(meilleur.h.length, req.length)) {
+        detail += ` · divergence au message ${k} : requete ${req[k] ? forme(messages[k]) : 'absent'}`
+          + ` contre ${meilleur.f[k] || 'absent'}`;
+      }
+      const sys = String(system || '');
+      if (meilleur.sysTexte !== sys) {
+        let i = 0;
+        while (i < sys.length && sys[i] === meilleur.sysTexte[i]) i += 1;
+        detail += ` · systeme different des le car ${i} (${meilleur.sysTexte.length} -> ${sys.length}) :`
+          + ` ${JSON.stringify(meilleur.sysTexte.slice(i, i + 60))} -> ${JSON.stringify(sys.slice(i, i + 60))}`;
+      }
+    } else {
+      detail += ` · aucune entree (${reprises.size} en memoire)`;
+    }
+  }
+  console.log(`[relais] reprise ratee (${raison}) : ${detail}`);
+}
+
+/*
+ * Revues annexes d'Hermes en relais (2026-10-15). Apres un tour, Hermes relance
+ * le meme historique suivi d'une consigne de revue (skills, memoire). Sans
+ * traitement, la revue partait en session neuve : 12 revues sur 16 appels du
+ * goal Amazon, 150k a 200k tokens reecrits chacune. Comme server.js, elle part
+ * desormais sur une COPIE de la session (`--fork-session`), sans consommer
+ * l'entree de reprise ni en poser une nouvelle : le vrai tour suivant de VJ
+ * reprend toujours la chaine principale.
+ */
+const PREFIXES_ANNEXES = [
+  'Review the conversation above and update the skill library',
+  'Review the conversation above and consider saving to memory',
+];
+function estAnnexe(texte) {
+  const t = String(texte || '').trimStart();
+  return PREFIXES_ANNEXES.some((p) => t.startsWith(p));
+}
+
+/**
+ * La requete prolonge-t-elle un tour termine ? Rend { id, tours, texte, annexe }
+ * ou null. Une revue annexe laisse l'entree en place.
+ */
 function chercherReprise(messages, system) {
-  if (!REPRISE_ACTIVE || messages.length < 3) return null;
+  if (!REPRISE_ACTIVE) return null;
+  if (messages.length < 3) return null;
   purgerReprises();
   const dernier = messages[messages.length - 1];
-  if (!dernier || dernier.role !== 'user' || messages[messages.length - 2]?.role !== 'assistant') return null;
+  if (!dernier || dernier.role !== 'user' || messages[messages.length - 2]?.role !== 'assistant') {
+    journaliserRatee(messages, system, 'forme'); return null;
+  }
   const texte = deps.extractText(dernier.content);
-  if (!texte) return null;
+  if (!texte) { journaliserRatee(messages, system, 'texte vide'); return null; }
   const cle = empreinte(messages.slice(0, -2));
   const r = reprises.get(cle);
-  if (!r || r.sys !== empreinteSys(system) || r.tours >= REPRISE_TOURS_MAX) return null;
-  reprises.delete(cle);
-  return { id: r.id, tours: r.tours, texte };
+  if (!r) { journaliserRatee(messages, system, 'absente'); return null; }
+  if (r.sys !== empreinteSys(system)) { journaliserRatee(messages, system, 'sys'); return null; }
+  if (r.tours >= REPRISE_TOURS_MAX) { journaliserRatee(messages, system, 'tours max'); return null; }
+  const annexe = estAnnexe(texte);
+  if (!annexe) { reprises.delete(cle); sauverReprises(); }
+  return { id: r.id, tours: r.tours, texte, annexe };
 }
 
 function init(d) { deps = d; }
@@ -387,11 +518,13 @@ async function traiter({ req, res, model, prompt, system, spec, inputTokens, str
     cliId: reprise ? reprise.id : crypto.randomUUID(),
     tours: reprise ? reprise.tours + 1 : 1,
     sys: empreinteSys(system),
+    systeme: system,
+    annexe: Boolean(reprise?.annexe),
   };
   sessions.set(sid, session);
   armerTtl(session);
   console.log(`[relais ${sid}] demarrage, ${outils.length} outils du client, modele ${model}`
-    + (reprise ? `, reprise ${reprise.id} tour ${session.tours} : ${reprise.texte.length} car au lieu de ${prompt.length}`
+    + (reprise ? `, ${reprise.annexe ? 'revue annexe (copie) de' : 'reprise'} ${reprise.id} tour ${session.tours} : ${reprise.texte.length} car au lieu de ${prompt.length}`
       : `, session neuve ${session.cliId} (${prompt.length} car)`));
 
   session.promesseCli = deps.runClaude(
@@ -400,7 +533,8 @@ async function traiter({ req, res, model, prompt, system, spec, inputTokens, str
       system,
       spec: { ...spec, relaisMcp: { sid, noms: outils.map((o) => o.name) } },
       images: [],
-      sessionArgs: reprise ? ['--resume', reprise.id] : ['--session-id', session.cliId],
+      sessionArgs: !reprise ? ['--session-id', session.cliId]
+        : (reprise.annexe ? ['--resume', reprise.id, '--fork-session'] : ['--resume', reprise.id]),
     },
     (t) => { session.texteCumule += t; },
   );
@@ -422,8 +556,10 @@ async function attendreEtRepondre(session, res, model, inputTokens, stream, mess
   if (ev.type === 'fin') {
     const texte = ev.texte || session.texteCumule;
     // Le tour suivant pourra reprendre cette session CLI (voir chercherReprise).
-    if (REPRISE_ACTIVE) {
-      reprises.set(empreinte(messages), { id: session.cliId, sys: session.sys, tours: session.tours, ts: Date.now() });
+    // Une revue annexe tourne sur une copie : la chaine principale reste celle du tour.
+    if (REPRISE_ACTIVE && !session.annexe) {
+      reprises.set(empreinte(messages), entreeReprise(session, messages, session.systeme));
+      sauverReprises();
     }
     fermerSession(session, 'terminee');
     repondre(res, corpsFinal(texte, model, inputTokens), stream);

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 '/home/vj/Bureau/Projets/claude-proxy/.codex/hooks/bash_guard.py'",
+            "command": "python3 '/home/vj/Bureau/Projets/perso/agent/claude-proxy/.codex/hooks/bash_guard.py'",
             "timeout": 10
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash '/home/vj/Bureau/Projets/claude-proxy/.codex/hooks/playwright_cleanup.sh'",
+            "command": "bash '/home/vj/Bureau/Projets/perso/agent/claude-proxy/.codex/hooks/playwright_cleanup.sh'",
             "timeout": 10
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 '/home/vj/Bureau/Projets/claude-proxy/.codex/hooks/stuck_detector.py'",
+            "command": "python3 '/home/vj/Bureau/Projets/perso/agent/claude-proxy/.codex/hooks/stuck_detector.py'",
             "timeout": 10
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash '/home/vj/Bureau/Projets/claude-proxy/.codex/hooks/playwright_cleanup.sh'",
+            "command": "bash '/home/vj/Bureau/Projets/perso/agent/claude-proxy/.codex/hooks/playwright_cleanup.sh'",
             "timeout": 10
           }
         ]
