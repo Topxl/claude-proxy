@@ -18,3 +18,8 @@ web-articles/
 # Lien local vers claude-supertool, propre a la machine
 supertool
 __pycache__/
+.env
+A_tok.json
+A_tx.json
+B_tok.json
+B_tx.json
